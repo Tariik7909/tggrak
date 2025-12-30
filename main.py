@@ -28,7 +28,7 @@ CHAT_ID = -10033283c29377
 DAILY_THREAD_ID = None   # General topic (None = main chat)
 VERIFY_THREAD_ID = 4     # Topic 4
 
-PHOTO_PATH = "image"
+PHOTO_PATH = "image (6).png"
 
 DAILY_SECONDS = 17
 VERIFY_SECONDS = 15          # elke 2 uur (echte joiners)
