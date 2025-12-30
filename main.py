@@ -349,42 +349,21 @@ async def activity_loop(app: Application):
 
         await asyncio.sleep(ACTIVITY_SECONDS)
 
-Yes, ik kan dat!
-Hieronder krijg je **kant-en-klare Python-code** voor:
-
-✔️ **opgeslagen namen bewaren** in een JSON-bestand
-✔️ **zodat ze NIET steeds opnieuw gebruikt worden totdat iedereen geweest is**
-✔️ **elke nacht om 05:00 Amsterdam tijd alle berichten in je verify-kanaal verwijderen**
-
-> ⚠️ *Bij Telegram-bots kun je berichten alleen verwijderen als jouw bot ze heeft verstuurd, of als je admin bent met delete-rechten.*
-
----
-
-# ✅ **CODE — Namen opslaan + dagelijks messages verwijderen**
-
-> **Plaats dit onderaan je bot-bestand** (of vervang je huidige scheduler + naam-opslaan functies)
-
-```python
 import json
 import pytz
 import asyncio
-from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    ContextTypes,
-    CommandHandler,
-)
-from datetime import datetime, time
+from datetime import time, datetime
+from telegram.ext import ContextTypes
 
-# ====== BESTANDSLOCATIES ======
+# Bestandslocaties
 NAMES_FILE = "joined_names.json"
 USED_FILE = "used_names_cycle.json"
 
-VERIFY_CHAT_ID = -1001234567890   # <-- verander naar jouw verify channel ID
+# Zet hier jouw verify kanaal ID
+VERIFY_CHAT_ID = -1003328329377
 
 
-# ====== NAAM OPSLA SYSTEEM ======
-
+# ============= JSON OPSLA FUNCTIES =============
 def load_json(path):
     try:
         with open(path, "r") as f:
@@ -398,8 +377,9 @@ def save_json(path, data):
         json.dump(data, f, indent=2)
 
 
+# ============= NAAM SYSTEEM =============
 def remember_joined_name(name: str):
-    """Slaat naam op, maar alleen als deze nog niet bestaat"""
+    """Slaat de naam op als die nog niet bestaat"""
     names = load_json(NAMES_FILE)
     if name not in names:
         names.append(name)
@@ -413,7 +393,7 @@ def get_next_name():
 
     remaining = [n for n in all_names if n not in used]
 
-    if not remaining:  # cycle opnieuw
+    if not remaining:
         save_json(USED_FILE, [])
         remaining = all_names
 
@@ -423,18 +403,31 @@ def get_next_name():
     return next_name
 
 
-# ====== VERIFICATION CHANNEL CLEAR OM 05:00 NL TIJD ======
-
+# ============= VERIFY KANAAL OPSCHONEN OM 05:00 NL TIJD =============
 async def clear_verify_channel(context: ContextTypes.DEFAULT_TYPE):
-    """Verwijdert ALLE berichten uit het verify kanaal om 05:00 NL tijd"""
-    chat = await context.bot.get_chat(VERIFY_CHAT_ID)
+    """Verwijdert alle berichten in het verify kanaal"""
+    try:
+        chat = await context.bot.get_chat(VERIFY_CHAT_ID)
 
-    async for msg in chat.get_history(limit=999):
-        try:
-            await context.bot.delete_message(chat_id=VERIFY_CHAT_ID, message_id=msg.message_id)
-            await asyncio.sleep(0.1)  # beetje vertraging zodat Telegram niet blokt
-        except
-```
+        async for msg in chat.get_history(limit=1000):
+            try:
+                await context.bot.delete_message(chat_id=VERIFY_CHAT_ID, message_id=msg.message_id)
+                await asyncio.sleep(0.1)
+            except Exception:
+                pass
+    except Exception as e:
+        print("Error tijdens opschonen verify kanaal:", e)
+
+
+# ============= DAILY JOB SCHEDULER =============
+async def schedule_verify_cleanup(application):
+    tz = pytz.timezone("Europe/Amsterdam")
+    application.job_queue.run_daily(
+        clear_verify_channel,
+        time=time(hour=5, minute=0, tzinfo=tz),  # 05:00 NL tijd
+        name="Verify Cleanup"
+    )
+
 
 
 # ================== INIT ==================
