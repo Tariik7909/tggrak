@@ -31,7 +31,7 @@ CHAT_ID = -1003328329377   # ✅ fix: alleen cijfers
 DAILY_THREAD_ID = None     # General topic (None = main chat)
 VERIFY_THREAD_ID = 4       # Topic 4
 
-PHOTO_PATH = "banner.jpg"
+PHOTO_PATH = "image (6).png"
 
 DAILY_SECONDS = 17
 VERIFY_SECONDS = 15
