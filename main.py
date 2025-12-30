@@ -1,5 +1,4 @@
 import os
-import json
 import asyncio
 import random
 import logging
@@ -7,7 +6,7 @@ import string
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-import asyncpg  # ✅ nieuw
+import asyncpg
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -17,22 +16,24 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.error import RetryAfter, TimedOut, NetworkError, Forbidden, BadRequest
 
 logging.basicConfig(level=logging.INFO)
 
 # ================== CONFIG ==================
 TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")  # ✅ Railway Postgres
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 TZ = ZoneInfo("Europe/Amsterdam")
-RESET_AT = time(5, 0)  # 05:00 NL-tijd reset
+RESET_AT = time(5, 0)  # 05:00 Amsterdam boundary
 
-CHAT_ID = -1003328329377   # ✅ fix: alleen cijfers
-DAILY_THREAD_ID = None     # General topic (None = main chat)
-VERIFY_THREAD_ID = 4       # Topic 4
+CHAT_ID = -1003328329377  # <-- FIX: alleen cijfers
+DAILY_THREAD_ID = None
+VERIFY_THREAD_ID = 4
 
-PHOTO_PATH = "image (6).png"
+PHOTO_PATH = "banner.jpg"
 
+# TEST intervals (seconds) - jij gebruikt test tijden
 DAILY_SECONDS = 17
 VERIFY_SECONDS = 15
 JOIN_DELAY_SECONDS = 5 * 60
@@ -41,9 +42,15 @@ ACTIVITY_SECONDS = 15
 DELETE_DAILY_SECONDS = 34
 DELETE_LEAVE_SECONDS = 10000 * 6000
 
-# ================== DB (GLOBAL) ==================
+# ===== OPTIE B: prune verify-message logging =====
+BOT_MSG_RETENTION_DAYS = 2
+BOT_MSG_MAX_ROWS = 20000
+BOT_MSG_PRUNE_EVERY = 200
+BOT_MSG_PRUNE_COUNTER = 0
+
+# ================== DB GLOBALS ==================
 DB_POOL: asyncpg.Pool | None = None
-JOINED_NAMES: list[str] = []  # blijft bestaan in memory, syncen we vanuit DB
+JOINED_NAMES: list[str] = []  # in-memory cache
 
 # ================== CONTENT ==================
 WELCOME_TEXT = (
@@ -68,6 +75,19 @@ def build_keyboard():
 def unlocked_text(name: str) -> str:
     return f"{name} Successfully unlocked the group✅"
 
+# ================== SAFETY: TASK CRASH LOGGING ==================
+def safe_create_task(coro, name: str):
+    task = asyncio.create_task(coro)
+
+    def _done(t: asyncio.Task):
+        try:
+            t.result()
+        except Exception:
+            logging.exception("Task crashed: %s", name)
+
+    task.add_done_callback(_done)
+    return task
+
 # ================== CYCLE HELPERS ==================
 def current_cycle_id(now: datetime) -> str:
     local = now.astimezone(TZ)
@@ -77,14 +97,11 @@ def current_cycle_id(now: datetime) -> str:
         cycle_date = local.date()
     return cycle_date.isoformat()
 
-# ================== DB SETUP ==================
+# ================== DB ==================
 async def db_init():
-    """
-    Maakt tabellen aan als ze nog niet bestaan.
-    """
     global DB_POOL
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL ontbreekt. Voeg Railway Postgres toe of zet env var DATABASE_URL.")
+        raise RuntimeError("DATABASE_URL ontbreekt. Zet DATABASE_URL in je BOT service variables.")
 
     DB_POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
 
@@ -95,6 +112,7 @@ async def db_init():
             first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
         """)
+
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS used_names (
             cycle_id DATE NOT NULL,
@@ -102,6 +120,7 @@ async def db_init():
             PRIMARY KEY (cycle_id, name)
         );
         """)
+
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS bot_verify_messages (
             message_id BIGINT PRIMARY KEY,
@@ -109,22 +128,38 @@ async def db_init():
         );
         """)
 
+        await conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_bot_verify_messages_created_at
+        ON bot_verify_messages(created_at);
+        """)
+
+    logging.info("DB initialized ok")
+
 async def db_load_joined_names_into_memory():
     global JOINED_NAMES
     async with DB_POOL.acquire() as conn:
         rows = await conn.fetch("SELECT name FROM joined_names ORDER BY first_seen ASC;")
     JOINED_NAMES = [r["name"] for r in rows]
+    logging.info("Loaded %d joined names from DB", len(JOINED_NAMES))
 
 async def db_remember_joined_name(name: str):
     name = (name or "").strip()
     if not name:
         return
-    async with DB_POOL.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO joined_names(name) VALUES($1) ON CONFLICT (name) DO NOTHING;",
-            name
-        )
-    # sync in-memory list (snel)
+
+    # retry 3x
+    for attempt in range(3):
+        try:
+            async with DB_POOL.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO joined_names(name) VALUES($1) ON CONFLICT (name) DO NOTHING;",
+                    name
+                )
+            break
+        except Exception:
+            logging.exception("DB remember name failed attempt=%s", attempt + 1)
+            await asyncio.sleep(1 + attempt)
+
     if name not in JOINED_NAMES:
         JOINED_NAMES.append(name)
 
@@ -139,71 +174,137 @@ async def db_is_used(name: str) -> bool:
 
 async def db_mark_used(name: str):
     cid = current_cycle_id(datetime.now(TZ))
-    async with DB_POOL.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO used_names(cycle_id, name) VALUES($1::date, $2) ON CONFLICT DO NOTHING;",
-            cid, name
-        )
+    for attempt in range(3):
+        try:
+            async with DB_POOL.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO used_names(cycle_id, name) VALUES($1::date, $2) ON CONFLICT DO NOTHING;",
+                    cid, name
+                )
+            return
+        except Exception:
+            logging.exception("DB mark used failed attempt=%s", attempt + 1)
+            await asyncio.sleep(1 + attempt)
 
 async def db_track_bot_verify_message_id(message_id: int):
-    async with DB_POOL.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO bot_verify_messages(message_id) VALUES($1) ON CONFLICT DO NOTHING;",
-            int(message_id)
-        )
+    """
+    Optie B: log message ids, maar prune zodat DB niet vol loopt.
+    """
+    global BOT_MSG_PRUNE_COUNTER
 
-# ================== HELPERS ==================
+    for attempt in range(3):
+        try:
+            async with DB_POOL.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO bot_verify_messages(message_id) VALUES($1) ON CONFLICT DO NOTHING;",
+                    int(message_id)
+                )
+
+                BOT_MSG_PRUNE_COUNTER += 1
+                if BOT_MSG_PRUNE_COUNTER % BOT_MSG_PRUNE_EVERY != 0:
+                    return
+
+                # 1) retention
+                await conn.execute(
+                    f"DELETE FROM bot_verify_messages "
+                    f"WHERE created_at < NOW() - INTERVAL '{BOT_MSG_RETENTION_DAYS} days';"
+                )
+
+                # 2) cap max rows (delete oldest beyond cap)
+                await conn.execute(
+                    """
+                    DELETE FROM bot_verify_messages
+                    WHERE message_id IN (
+                        SELECT message_id
+                        FROM bot_verify_messages
+                        ORDER BY created_at DESC
+                        OFFSET $1
+                    );
+                    """,
+                    BOT_MSG_MAX_ROWS
+                )
+            return
+        except Exception:
+            logging.exception("DB track bot message failed attempt=%s", attempt + 1)
+            await asyncio.sleep(1 + attempt)
+
+# ================== TELEGRAM SEND WRAPPERS ==================
+async def safe_send(coro_factory, what: str):
+    """
+    coro_factory: lambda -> awaitable Telegram API call
+    Handles RetryAfter + transient errors so loops don't die.
+    """
+    while True:
+        try:
+            return await coro_factory()
+        except RetryAfter as e:
+            logging.warning("%s rate limited. Sleep %s sec", what, e.retry_after)
+            await asyncio.sleep(e.retry_after + 1)
+        except (TimedOut, NetworkError) as e:
+            logging.warning("%s transient network error: %s. retry in 3s", what, e)
+            await asyncio.sleep(3)
+        except Forbidden as e:
+            logging.exception("%s forbidden (rights/bot kicked?): %s", what, e)
+            raise
+        except BadRequest as e:
+            logging.exception("%s bad request: %s", what, e)
+            raise
+        except Exception as e:
+            logging.exception("%s unexpected error: %s", what, e)
+            await asyncio.sleep(2)
+
 async def delete_later(bot, chat_id, message_id, delay_seconds: int):
     await asyncio.sleep(delay_seconds)
     try:
-        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        await safe_send(lambda: bot.delete_message(chat_id=chat_id, message_id=message_id), "delete_message")
     except Exception:
         pass
 
 async def send_text(bot, chat_id, thread_id, text):
     if thread_id is None:
-        msg = await bot.send_message(chat_id=chat_id, text=text)
+        msg = await safe_send(lambda: bot.send_message(chat_id=chat_id, text=text), "send_message(main)")
         return msg
 
-    msg = await bot.send_message(chat_id=chat_id, message_thread_id=thread_id, text=text)
+    msg = await safe_send(
+        lambda: bot.send_message(chat_id=chat_id, message_thread_id=thread_id, text=text),
+        f"send_message(thread={thread_id})"
+    )
 
-    # ✅ bot message-id tracking in verify topic
     if thread_id == VERIFY_THREAD_ID:
         await db_track_bot_verify_message_id(msg.message_id)
 
     return msg
 
 async def send_photo(bot, chat_id, thread_id, photo_path, caption, reply_markup):
-    with open(photo_path, "rb") as photo:
+    # Let op: als banner.jpg mist, task crasht — safe_create_task laat het zien.
+    def _factory(photo_file):
         if thread_id is None:
-            msg = await bot.send_photo(
+            return lambda: bot.send_photo(
                 chat_id=chat_id,
-                photo=photo,
+                photo=photo_file,
                 caption=caption,
                 reply_markup=reply_markup,
                 has_spoiler=True
             )
-            return msg
-
-        msg = await bot.send_photo(
+        return lambda: bot.send_photo(
             chat_id=chat_id,
             message_thread_id=thread_id,
-            photo=photo,
+            photo=photo_file,
             caption=caption,
             reply_markup=reply_markup,
             has_spoiler=True
         )
 
-        # ✅ track ook foto’s als je ooit in verify topic post
-        if thread_id == VERIFY_THREAD_ID:
-            await db_track_bot_verify_message_id(msg.message_id)
+    with open(photo_path, "rb") as photo:
+        msg = await safe_send(_factory(photo), "send_photo")
 
-        return msg
+    if thread_id == VERIFY_THREAD_ID:
+        await db_track_bot_verify_message_id(msg.message_id)
+
+    return msg
 
 # ================== RESET LOOP (05:00) ==================
 async def reset_loop():
-    # Jij reset hier USED names; met DB is dat niet nodig om te “clearen”
-    # want we gebruiken cycle_id als key. Maar we laten je loop bestaan.
     while True:
         now = datetime.now(TZ)
         target = datetime.combine(now.date(), RESET_AT, tzinfo=TZ)
@@ -211,9 +312,9 @@ async def reset_loop():
             target = target + timedelta(days=1)
 
         await asyncio.sleep(max(1, int((target - now).total_seconds())))
-        logging.info("Reset cycle boundary at 05:00")
+        logging.info("Cycle boundary reached at 05:00 (used_names are naturally per cycle_id)")
 
-# ================== ✅ 05:00 CLEANUP (BOT-berichten in topic 4) ==================
+# ================== 05:00 CLEANUP VERIFY TOPIC (BOT MESSAGES) ==================
 async def cleanup_verify_topic_loop(app: Application):
     while True:
         now = datetime.now(TZ)
@@ -223,19 +324,22 @@ async def cleanup_verify_topic_loop(app: Application):
 
         await asyncio.sleep(max(1, int((target - now).total_seconds())))
 
-        # haal alle bot-bericht IDs op
         async with DB_POOL.acquire() as conn:
             rows = await conn.fetch("SELECT message_id FROM bot_verify_messages;")
-        ids = [int(r["message_id"]) for r in rows]
 
+        ids = [int(r["message_id"]) for r in rows]
         kept = []
+
         for mid in ids:
             try:
-                await app.bot.delete_message(chat_id=CHAT_ID, message_id=mid)
+                await safe_send(
+                    lambda: app.bot.delete_message(chat_id=CHAT_ID, message_id=mid),
+                    "cleanup_delete_message"
+                )
             except Exception:
                 kept.append(mid)
 
-        # update DB: alleen failed deletes bewaren
+        # Rewrite table with kept only
         async with DB_POOL.acquire() as conn:
             await conn.execute("TRUNCATE TABLE bot_verify_messages;")
             if kept:
@@ -244,7 +348,7 @@ async def cleanup_verify_topic_loop(app: Application):
                     [(m,) for m in kept]
                 )
 
-        logging.info("Cleanup verify-topic bot messages at 05:00 done")
+        logging.info("Cleanup verify-topic bot messages at 05:00 done. kept=%d", len(kept))
 
 # ================== BUTTON POPUP ==================
 async def on_open_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -253,12 +357,13 @@ async def on_open_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
         show_alert=True
     )
 
-# ================== JOIN -> NA 15 MIN ==================
+# ================== JOIN -> AFTER DELAY ==================
 async def announce_join_after_delay(context: ContextTypes.DEFAULT_TYPE, name: str):
     await asyncio.sleep(JOIN_DELAY_SECONDS)
     name = (name or "").strip()
     if not name:
         return
+
     if await db_is_used(name):
         return
 
@@ -275,7 +380,7 @@ async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name = (member.full_name or "").strip()
         if name:
             await db_remember_joined_name(name)
-            asyncio.create_task(announce_join_after_delay(context, name))
+            safe_create_task(announce_join_after_delay(context, name), f"announce_join_after_delay({name})")
 
 # ================== DAILY POST ==================
 async def daily_post_loop(app: Application):
@@ -288,13 +393,11 @@ async def daily_post_loop(app: Application):
         )
 
         if last_msg_id:
-            asyncio.create_task(
-                delete_later(app.bot, CHAT_ID, last_msg_id, DELETE_DAILY_SECONDS)
-            )
+            safe_create_task(delete_later(app.bot, CHAT_ID, last_msg_id, DELETE_DAILY_SECONDS), "delete_old_daily")
         last_msg_id = msg.message_id
 
         try:
-            await app.bot.pin_chat_message(chat_id=CHAT_ID, message_id=msg.message_id)
+            await safe_send(lambda: app.bot.pin_chat_message(chat_id=CHAT_ID, message_id=msg.message_id), "pin_chat_message")
         except Exception:
             pass
 
@@ -303,17 +406,18 @@ async def daily_post_loop(app: Application):
 # ================== VERIFY LOOP ==================
 async def verify_random_joiner_loop(app: Application):
     while True:
-        available = [n for n in JOINED_NAMES if n]
-        if available:
-            name = random.choice(available)
-            if not await db_is_used(name):
+        if JOINED_NAMES:
+            name = random.choice([n for n in JOINED_NAMES if n])
+            if name and (not await db_is_used(name)):
                 await send_text(app.bot, CHAT_ID, VERIFY_THREAD_ID, unlocked_text(name))
                 await db_mark_used(name)
 
         await asyncio.sleep(VERIFY_SECONDS)
 
 # ================== ALIAS GENERATOR (jouw originele) ==================
-NL_CITY_CODES = ["010","020","030","040","050","070","073","076","079","071","072","074","075","078"]
+NL_CITY_CODES = [
+    "010","020","030","040","050","070","073","076","079","071","072","074","075","078"
+]
 SEPARATORS = ["_", ".", "-"]
 PREFIXES = ["x", "mr", "its", "real", "official", "the", "iam", "nl", "dm", "vip", "urban", "city", "only"]
 EMOJIS = ["🔥", "💎", "👻", "⚡", "🚀", "✅"]
@@ -382,22 +486,29 @@ async def activity_loop(app: Application):
 
         msg = await send_text(app.bot, CHAT_ID, VERIFY_THREAD_ID, text)
 
-        asyncio.create_task(
-            delete_later(app.bot, CHAT_ID, msg.message_id, DELETE_LEAVE_SECONDS)
-        )
-
+        safe_create_task(delete_later(app.bot, CHAT_ID, msg.message_id, DELETE_LEAVE_SECONDS), "delete_activity_msg")
         await asyncio.sleep(ACTIVITY_SECONDS)
 
 # ================== INIT ==================
 async def post_init(app: Application):
-    await db_init()                           # ✅ nieuw
-    await db_load_joined_names_into_memory()  # ✅ nieuw (laad namen bij start)
+    me = await app.bot.get_me()
+    logging.info("Bot started: @%s", me.username)
 
-    asyncio.create_task(reset_loop())
-    asyncio.create_task(cleanup_verify_topic_loop(app))  # ✅ 05:00 cleanup
-    asyncio.create_task(daily_post_loop(app))
-    asyncio.create_task(verify_random_joiner_loop(app))
-    asyncio.create_task(activity_loop(app))
+    await db_init()
+    await db_load_joined_names_into_memory()
+
+    # quick startup test to main chat (helps debug rights/chat_id)
+    try:
+        await safe_send(lambda: app.bot.send_message(chat_id=CHAT_ID, text="✅ bot gestart (startup test)"), "startup_test")
+        logging.info("Startup test message sent ok to CHAT_ID=%s", CHAT_ID)
+    except Exception:
+        logging.exception("Startup test FAILED. Check CHAT_ID, bot membership, rights.")
+
+    safe_create_task(reset_loop(), "reset_loop")
+    safe_create_task(cleanup_verify_topic_loop(app), "cleanup_verify_topic_loop")
+    safe_create_task(daily_post_loop(app), "daily_post_loop")
+    safe_create_task(verify_random_joiner_loop(app), "verify_random_joiner_loop")
+    safe_create_task(activity_loop(app), "activity_loop")
 
 def main():
     app = Application.builder().token(TOKEN).post_init(post_init).build()
