@@ -28,7 +28,7 @@ CHAT_ID = -1003328329377
 DAILY_THREAD_ID = None   # General topic (None = main chat)
 VERIFY_THREAD_ID = 4     # Topic 4
 
-PHOTO_PATH = "image (6).png"
+PHOTO_PATH = "banner.jpg"
 
 DAILY_SECONDS = 17
 VERIFY_SECONDS = 15          # elke 2 uur (echte joiners)
@@ -348,87 +348,6 @@ async def activity_loop(app: Application):
         )
 
         await asyncio.sleep(ACTIVITY_SECONDS)
-
-import json
-import pytz
-import asyncio
-from datetime import time, datetime
-from telegram.ext import ContextTypes
-
-# Bestandslocaties
-NAMES_FILE = "joined_names.json"
-USED_FILE = "used_names_cycle.json"
-
-# Zet hier jouw verify kanaal ID
-VERIFY_CHAT_ID = -1003328329377
-
-
-# ============= JSON OPSLA FUNCTIES =============
-def load_json(path):
-    try:
-        with open(path, "r") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return []
-
-
-def save_json(path, data):
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
-
-
-# ============= NAAM SYSTEEM =============
-def remember_joined_name(name: str):
-    """Slaat de naam op als die nog niet bestaat"""
-    names = load_json(NAMES_FILE)
-    if name not in names:
-        names.append(name)
-        save_json(NAMES_FILE, names)
-
-
-def get_next_name():
-    """Geeft elke naam 1x totdat iedereen geweest is, daarna reset"""
-    all_names = load_json(NAMES_FILE)
-    used = load_json(USED_FILE)
-
-    remaining = [n for n in all_names if n not in used]
-
-    if not remaining:
-        save_json(USED_FILE, [])
-        remaining = all_names
-
-    next_name = remaining[0]
-    used.append(next_name)
-    save_json(USED_FILE, used)
-    return next_name
-
-
-# ============= VERIFY KANAAL OPSCHONEN OM 05:00 NL TIJD =============
-async def clear_verify_channel(context: ContextTypes.DEFAULT_TYPE):
-    """Verwijdert alle berichten in het verify kanaal"""
-    try:
-        chat = await context.bot.get_chat(VERIFY_CHAT_ID)
-
-        async for msg in chat.get_history(limit=1000):
-            try:
-                await context.bot.delete_message(chat_id=VERIFY_CHAT_ID, message_id=msg.message_id)
-                await asyncio.sleep(0.1)
-            except Exception:
-                pass
-    except Exception as e:
-        print("Error tijdens opschonen verify kanaal:", e)
-
-
-# ============= DAILY JOB SCHEDULER =============
-async def schedule_verify_cleanup(application):
-    tz = pytz.timezone("Europe/Amsterdam")
-    application.job_queue.run_daily(
-        clear_verify_channel,
-        time=time(hour=5, minute=0, tzinfo=tz),  # 05:00 NL tijd
-        name="Verify Cleanup"
-    )
-
-
 
 # ================== INIT ==================
 async def post_init(app: Application):
