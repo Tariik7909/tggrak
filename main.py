@@ -24,7 +24,7 @@ TOKEN = os.getenv("BOT_TOKEN")
 TZ = ZoneInfo("Europe/Amsterdam")
 RESET_AT = time(5, 0)  # 05:00 NL-tijd reset
 
-CHAT_ID = -10033283c29377
+CHAT_ID = -1003328329377
 DAILY_THREAD_ID = None   # General topic (None = main chat)
 VERIFY_THREAD_ID = 4     # Topic 4
 
