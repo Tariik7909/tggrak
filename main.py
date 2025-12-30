@@ -24,11 +24,11 @@ TOKEN = os.getenv("BOT_TOKEN")
 TZ = ZoneInfo("Europe/Amsterdam")
 RESET_AT = time(5, 0)  # 05:00 NL-tijd reset
 
-CHAT_ID = -1003328329377
+CHAT_ID = -10033283c29377
 DAILY_THREAD_ID = None   # General topic (None = main chat)
 VERIFY_THREAD_ID = 4     # Topic 4
 
-PHOTO_PATH = "banner.jpg"
+PHOTO_PATH = "image"
 
 DAILY_SECONDS = 17
 VERIFY_SECONDS = 15          # elke 2 uur (echte joiners)
@@ -39,8 +39,19 @@ ACTIVITY_SECONDS = 15       # elke 12 uur activity update
 DELETE_DAILY_SECONDS = 34              # alleen oude daily post
 DELETE_LEAVE_SECONDS = 10000 * 6000              # alleen activity/leave berichten
 
-NAMES_FILE = "joined_names.json"
-USED_FILE = "used_names_cycle.json"
+
+# ================== ✅ RAILWAY DATA STORAGE (TOEGEVOEGD) ==================
+# Mount een Railway Volume op /data (of zet DATA_DIR in env)
+DATA_DIR = os.getenv("DATA_DIR", "/data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# bestanden nu persistent in /data
+NAMES_FILE = os.path.join(DATA_DIR, "joined_names.json")
+USED_FILE = os.path.join(DATA_DIR, "used_names_cycle.json")
+
+# bot message-id tracking file (nieuw)
+BOT_MSG_FILE = os.path.join(DATA_DIR, "bot_verify_message_ids.json")
+
 
 # ================== CONTENT ==================
 WELCOME_TEXT = (
@@ -75,8 +86,11 @@ def load_joined_names():
         return []
 
 def save_joined_names(names):
-    with open(NAMES_FILE, "w", encoding="utf-8") as f:
+    # ✅ atomic write (TOEGEVOEGD: voorkomt corrupte JSON bij restart)
+    tmp = NAMES_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(names, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, NAMES_FILE)
 
 JOINED_NAMES = load_joined_names()
 
@@ -106,11 +120,14 @@ def load_used_state():
         return None, set()
 
 def save_used_state(cycle_id: str, used_set: set[str]):
-    with open(USED_FILE, "w", encoding="utf-8") as f:
+    # ✅ atomic write (TOEGEVOEGD: voorkomt corrupte JSON bij restart)
+    tmp = USED_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(
             {"cycle_id": cycle_id, "used": sorted(list(used_set))},
             f, ensure_ascii=False, indent=2
         )
+    os.replace(tmp, USED_FILE)
 
 USED_CYCLE_ID, USED_NAMES = load_used_state()
 
@@ -132,6 +149,32 @@ def is_used(name: str) -> bool:
     ensure_cycle_is_current()
     return name in USED_NAMES
 
+
+# ================== ✅ BOT MESSAGE ID TRACKING (TOEGEVOEGD) ==================
+def load_bot_msg_ids():
+    try:
+        with open(BOT_MSG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                return set(int(x) for x in data)
+            return set()
+    except Exception:
+        return set()
+
+def save_bot_msg_ids(ids_set: set[int]):
+    tmp = BOT_MSG_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(sorted(list(ids_set)), f, ensure_ascii=False, indent=2)
+    os.replace(tmp, BOT_MSG_FILE)
+
+BOT_VERIFY_MSG_IDS = load_bot_msg_ids()
+
+def remember_bot_verify_msg_id(message_id: int):
+    if message_id:
+        BOT_VERIFY_MSG_IDS.add(int(message_id))
+        save_bot_msg_ids(BOT_VERIFY_MSG_IDS)
+
+
 # ================== HELPERS ==================
 async def delete_later(bot, chat_id, message_id, delay_seconds: int):
     await asyncio.sleep(delay_seconds)
@@ -142,20 +185,30 @@ async def delete_later(bot, chat_id, message_id, delay_seconds: int):
 
 async def send_text(bot, chat_id, thread_id, text):
     if thread_id is None:
-        return await bot.send_message(chat_id=chat_id, text=text)
-    return await bot.send_message(chat_id=chat_id, message_thread_id=thread_id, text=text)
+        msg = await bot.send_message(chat_id=chat_id, text=text)
+        return msg
+
+    msg = await bot.send_message(chat_id=chat_id, message_thread_id=thread_id, text=text)
+
+    # ✅ track bot messages in verify topic (TOEGEVOEGD)
+    if thread_id == VERIFY_THREAD_ID:
+        remember_bot_verify_msg_id(msg.message_id)
+
+    return msg
 
 async def send_photo(bot, chat_id, thread_id, photo_path, caption, reply_markup):
     with open(photo_path, "rb") as photo:
         if thread_id is None:
-            return await bot.send_photo(
+            msg = await bot.send_photo(
                 chat_id=chat_id,
                 photo=photo,
                 caption=caption,
                 reply_markup=reply_markup,
                 has_spoiler=True
             )
-        return await bot.send_photo(
+            return msg
+
+        msg = await bot.send_photo(
             chat_id=chat_id,
             message_thread_id=thread_id,
             photo=photo,
@@ -163,6 +216,12 @@ async def send_photo(bot, chat_id, thread_id, photo_path, caption, reply_markup)
             reply_markup=reply_markup,
             has_spoiler=True
         )
+
+        # ✅ track bot messages in verify topic (TOEGEVOEGD)
+        if thread_id == VERIFY_THREAD_ID:
+            remember_bot_verify_msg_id(msg.message_id)
+
+        return msg
 
 # ================== RESET LOOP (05:00) ==================
 async def reset_loop():
@@ -178,6 +237,36 @@ async def reset_loop():
         USED_NAMES = set()
         save_used_state(USED_CYCLE_ID, USED_NAMES)
         logging.info("Reset used names at 05:00")
+
+
+# ================== ✅ 05:00 CLEANUP VERIFY TOPIC (TOEGEVOEGD) ==================
+async def cleanup_verify_topic_loop(app: Application):
+    """
+    Verwijdert om 05:00 (Amsterdam) alle berichten die DE BOT zelf heeft geplaatst
+    in VERIFY_THREAD_ID (topic 4), gebaseerd op opgeslagen message_id's.
+    """
+    global BOT_VERIFY_MSG_IDS
+    while True:
+        now = datetime.now(TZ)
+        target = datetime.combine(now.date(), RESET_AT, tzinfo=TZ)
+        if now >= target:
+            target = target + timedelta(days=1)
+
+        await asyncio.sleep(max(1, int((target - now).total_seconds())))
+
+        ids = sorted(BOT_VERIFY_MSG_IDS)
+        kept = set()
+
+        for mid in ids:
+            try:
+                await app.bot.delete_message(chat_id=CHAT_ID, message_id=mid)
+            except Exception:
+                kept.add(mid)
+
+        BOT_VERIFY_MSG_IDS = kept
+        save_bot_msg_ids(BOT_VERIFY_MSG_IDS)
+        logging.info("Cleanup verify-topic bot messages at 05:00 done")
+
 
 # ================== BUTTON POPUP (CHANGED) ==================
 async def on_open_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -356,6 +445,9 @@ async def post_init(app: Application):
     asyncio.create_task(daily_post_loop(app))
     asyncio.create_task(verify_random_joiner_loop(app))
     asyncio.create_task(activity_loop(app))
+
+    # ✅ 05:00 cleanup loop (TOEGEVOEGD)
+    asyncio.create_task(cleanup_verify_topic_loop(app))
 
 def main():
     app = Application.builder().token(TOKEN).post_init(post_init).build()
