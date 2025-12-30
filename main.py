@@ -7,6 +7,8 @@ import string
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
+import asyncpg  # ✅ nieuw
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -20,38 +22,28 @@ logging.basicConfig(level=logging.INFO)
 
 # ================== CONFIG ==================
 TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")  # ✅ Railway Postgres
 
 TZ = ZoneInfo("Europe/Amsterdam")
 RESET_AT = time(5, 0)  # 05:00 NL-tijd reset
 
-CHAT_ID = -1003328329377
-DAILY_THREAD_ID = None   # General topic (None = main chat)
-VERIFY_THREAD_ID = 4     # Topic 4
+CHAT_ID = -1003328329377   # ✅ fix: alleen cijfers
+DAILY_THREAD_ID = None     # General topic (None = main chat)
+VERIFY_THREAD_ID = 4       # Topic 4
 
-PHOTO_PATH = "image (6).png"
+PHOTO_PATH = "banner.jpg"
 
 DAILY_SECONDS = 17
-VERIFY_SECONDS = 15          # elke 2 uur (echte joiners)
+VERIFY_SECONDS = 15
 JOIN_DELAY_SECONDS = 5 * 60
-ACTIVITY_SECONDS = 15       # elke 12 uur activity update
+ACTIVITY_SECONDS = 15
 
-# ✅ Delete regels zoals jij wilt
-DELETE_DAILY_SECONDS = 34              # alleen oude daily post
-DELETE_LEAVE_SECONDS = 10000 * 6000              # alleen activity/leave berichten
+DELETE_DAILY_SECONDS = 34
+DELETE_LEAVE_SECONDS = 10000 * 6000
 
-
-# ================== ✅ RAILWAY DATA STORAGE (TOEGEVOEGD) ==================
-# Mount een Railway Volume op /data (of zet DATA_DIR in env)
-DATA_DIR = os.getenv("DATA_DIR", "/data")
-os.makedirs(DATA_DIR, exist_ok=True)
-
-# bestanden nu persistent in /data
-NAMES_FILE = os.path.join(DATA_DIR, "joined_names.json")
-USED_FILE = os.path.join(DATA_DIR, "used_names_cycle.json")
-
-# bot message-id tracking file (nieuw)
-BOT_MSG_FILE = os.path.join(DATA_DIR, "bot_verify_message_ids.json")
-
+# ================== DB (GLOBAL) ==================
+DB_POOL: asyncpg.Pool | None = None
+JOINED_NAMES: list[str] = []  # blijft bestaan in memory, syncen we vanuit DB
 
 # ================== CONTENT ==================
 WELCOME_TEXT = (
@@ -76,31 +68,7 @@ def build_keyboard():
 def unlocked_text(name: str) -> str:
     return f"{name} Successfully unlocked the group✅"
 
-# ================== STORAGE: JOINED NAMES ==================
-def load_joined_names():
-    try:
-        with open(NAMES_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data, list) else []
-    except Exception:
-        return []
-
-def save_joined_names(names):
-    # ✅ atomic write (TOEGEVOEGD: voorkomt corrupte JSON bij restart)
-    tmp = NAMES_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(names, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, NAMES_FILE)
-
-JOINED_NAMES = load_joined_names()
-
-def remember_joined_name(name: str):
-    name = (name or "").strip()
-    if name and name not in JOINED_NAMES:
-        JOINED_NAMES.append(name)
-        save_joined_names(JOINED_NAMES)
-
-# ================== STORAGE: USED NAMES PER CYCLE (reset 05:00) ==================
+# ================== CYCLE HELPERS ==================
 def current_cycle_id(now: datetime) -> str:
     local = now.astimezone(TZ)
     if local.time() < RESET_AT:
@@ -109,71 +77,80 @@ def current_cycle_id(now: datetime) -> str:
         cycle_date = local.date()
     return cycle_date.isoformat()
 
-def load_used_state():
-    try:
-        with open(USED_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            cycle = data.get("cycle_id")
-            used = set(data.get("used", []))
-            return cycle, used
-    except Exception:
-        return None, set()
+# ================== DB SETUP ==================
+async def db_init():
+    """
+    Maakt tabellen aan als ze nog niet bestaan.
+    """
+    global DB_POOL
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL ontbreekt. Voeg Railway Postgres toe of zet env var DATABASE_URL.")
 
-def save_used_state(cycle_id: str, used_set: set[str]):
-    # ✅ atomic write (TOEGEVOEGD: voorkomt corrupte JSON bij restart)
-    tmp = USED_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(
-            {"cycle_id": cycle_id, "used": sorted(list(used_set))},
-            f, ensure_ascii=False, indent=2
+    DB_POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+
+    async with DB_POOL.acquire() as conn:
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS joined_names (
+            name TEXT PRIMARY KEY,
+            first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """)
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS used_names (
+            cycle_id DATE NOT NULL,
+            name TEXT NOT NULL,
+            PRIMARY KEY (cycle_id, name)
+        );
+        """)
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS bot_verify_messages (
+            message_id BIGINT PRIMARY KEY,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """)
+
+async def db_load_joined_names_into_memory():
+    global JOINED_NAMES
+    async with DB_POOL.acquire() as conn:
+        rows = await conn.fetch("SELECT name FROM joined_names ORDER BY first_seen ASC;")
+    JOINED_NAMES = [r["name"] for r in rows]
+
+async def db_remember_joined_name(name: str):
+    name = (name or "").strip()
+    if not name:
+        return
+    async with DB_POOL.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO joined_names(name) VALUES($1) ON CONFLICT (name) DO NOTHING;",
+            name
         )
-    os.replace(tmp, USED_FILE)
+    # sync in-memory list (snel)
+    if name not in JOINED_NAMES:
+        JOINED_NAMES.append(name)
 
-USED_CYCLE_ID, USED_NAMES = load_used_state()
+async def db_is_used(name: str) -> bool:
+    cid = current_cycle_id(datetime.now(TZ))
+    async with DB_POOL.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT 1 FROM used_names WHERE cycle_id = $1::date AND name = $2 LIMIT 1;",
+            cid, name
+        )
+    return row is not None
 
-def ensure_cycle_is_current():
-    global USED_CYCLE_ID, USED_NAMES
-    now = datetime.now(TZ)
-    cid = current_cycle_id(now)
-    if USED_CYCLE_ID != cid:
-        USED_CYCLE_ID = cid
-        USED_NAMES = set()
-        save_used_state(USED_CYCLE_ID, USED_NAMES)
+async def db_mark_used(name: str):
+    cid = current_cycle_id(datetime.now(TZ))
+    async with DB_POOL.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO used_names(cycle_id, name) VALUES($1::date, $2) ON CONFLICT DO NOTHING;",
+            cid, name
+        )
 
-def mark_used(name: str):
-    ensure_cycle_is_current()
-    USED_NAMES.add(name)
-    save_used_state(USED_CYCLE_ID, USED_NAMES)
-
-def is_used(name: str) -> bool:
-    ensure_cycle_is_current()
-    return name in USED_NAMES
-
-
-# ================== ✅ BOT MESSAGE ID TRACKING (TOEGEVOEGD) ==================
-def load_bot_msg_ids():
-    try:
-        with open(BOT_MSG_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if isinstance(data, list):
-                return set(int(x) for x in data)
-            return set()
-    except Exception:
-        return set()
-
-def save_bot_msg_ids(ids_set: set[int]):
-    tmp = BOT_MSG_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(sorted(list(ids_set)), f, ensure_ascii=False, indent=2)
-    os.replace(tmp, BOT_MSG_FILE)
-
-BOT_VERIFY_MSG_IDS = load_bot_msg_ids()
-
-def remember_bot_verify_msg_id(message_id: int):
-    if message_id:
-        BOT_VERIFY_MSG_IDS.add(int(message_id))
-        save_bot_msg_ids(BOT_VERIFY_MSG_IDS)
-
+async def db_track_bot_verify_message_id(message_id: int):
+    async with DB_POOL.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO bot_verify_messages(message_id) VALUES($1) ON CONFLICT DO NOTHING;",
+            int(message_id)
+        )
 
 # ================== HELPERS ==================
 async def delete_later(bot, chat_id, message_id, delay_seconds: int):
@@ -190,9 +167,9 @@ async def send_text(bot, chat_id, thread_id, text):
 
     msg = await bot.send_message(chat_id=chat_id, message_thread_id=thread_id, text=text)
 
-    # ✅ track bot messages in verify topic (TOEGEVOEGD)
+    # ✅ bot message-id tracking in verify topic
     if thread_id == VERIFY_THREAD_ID:
-        remember_bot_verify_msg_id(msg.message_id)
+        await db_track_bot_verify_message_id(msg.message_id)
 
     return msg
 
@@ -217,15 +194,16 @@ async def send_photo(bot, chat_id, thread_id, photo_path, caption, reply_markup)
             has_spoiler=True
         )
 
-        # ✅ track bot messages in verify topic (TOEGEVOEGD)
+        # ✅ track ook foto’s als je ooit in verify topic post
         if thread_id == VERIFY_THREAD_ID:
-            remember_bot_verify_msg_id(msg.message_id)
+            await db_track_bot_verify_message_id(msg.message_id)
 
         return msg
 
 # ================== RESET LOOP (05:00) ==================
 async def reset_loop():
-    global USED_CYCLE_ID, USED_NAMES
+    # Jij reset hier USED names; met DB is dat niet nodig om te “clearen”
+    # want we gebruiken cycle_id als key. Maar we laten je loop bestaan.
     while True:
         now = datetime.now(TZ)
         target = datetime.combine(now.date(), RESET_AT, tzinfo=TZ)
@@ -233,19 +211,10 @@ async def reset_loop():
             target = target + timedelta(days=1)
 
         await asyncio.sleep(max(1, int((target - now).total_seconds())))
-        USED_CYCLE_ID = current_cycle_id(datetime.now(TZ))
-        USED_NAMES = set()
-        save_used_state(USED_CYCLE_ID, USED_NAMES)
-        logging.info("Reset used names at 05:00")
+        logging.info("Reset cycle boundary at 05:00")
 
-
-# ================== ✅ 05:00 CLEANUP VERIFY TOPIC (TOEGEVOEGD) ==================
+# ================== ✅ 05:00 CLEANUP (BOT-berichten in topic 4) ==================
 async def cleanup_verify_topic_loop(app: Application):
-    """
-    Verwijdert om 05:00 (Amsterdam) alle berichten die DE BOT zelf heeft geplaatst
-    in VERIFY_THREAD_ID (topic 4), gebaseerd op opgeslagen message_id's.
-    """
-    global BOT_VERIFY_MSG_IDS
     while True:
         now = datetime.now(TZ)
         target = datetime.combine(now.date(), RESET_AT, tzinfo=TZ)
@@ -254,36 +223,47 @@ async def cleanup_verify_topic_loop(app: Application):
 
         await asyncio.sleep(max(1, int((target - now).total_seconds())))
 
-        ids = sorted(BOT_VERIFY_MSG_IDS)
-        kept = set()
+        # haal alle bot-bericht IDs op
+        async with DB_POOL.acquire() as conn:
+            rows = await conn.fetch("SELECT message_id FROM bot_verify_messages;")
+        ids = [int(r["message_id"]) for r in rows]
 
+        kept = []
         for mid in ids:
             try:
                 await app.bot.delete_message(chat_id=CHAT_ID, message_id=mid)
             except Exception:
-                kept.add(mid)
+                kept.append(mid)
 
-        BOT_VERIFY_MSG_IDS = kept
-        save_bot_msg_ids(BOT_VERIFY_MSG_IDS)
+        # update DB: alleen failed deletes bewaren
+        async with DB_POOL.acquire() as conn:
+            await conn.execute("TRUNCATE TABLE bot_verify_messages;")
+            if kept:
+                await conn.executemany(
+                    "INSERT INTO bot_verify_messages(message_id) VALUES($1) ON CONFLICT DO NOTHING;",
+                    [(m,) for m in kept]
+                )
+
         logging.info("Cleanup verify-topic bot messages at 05:00 done")
 
-
-# ================== BUTTON POPUP (CHANGED) ==================
+# ================== BUTTON POPUP ==================
 async def on_open_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer(
         "Can’t acces the group, because unfortunately you haven’t shared the group 3 times yet.",
         show_alert=True
     )
 
-# ================== JOIN -> NA 15 MIN (blijft staan) ==================
+# ================== JOIN -> NA 15 MIN ==================
 async def announce_join_after_delay(context: ContextTypes.DEFAULT_TYPE, name: str):
     await asyncio.sleep(JOIN_DELAY_SECONDS)
     name = (name or "").strip()
-    if not name or is_used(name):
+    if not name:
+        return
+    if await db_is_used(name):
         return
 
     await send_text(context.bot, CHAT_ID, VERIFY_THREAD_ID, unlocked_text(name))
-    mark_used(name)
+    await db_mark_used(name)
 
 async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.new_chat_members:
@@ -294,10 +274,10 @@ async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for member in update.message.new_chat_members:
         name = (member.full_name or "").strip()
         if name:
-            remember_joined_name(name)
+            await db_remember_joined_name(name)
             asyncio.create_task(announce_join_after_delay(context, name))
 
-# ================== DAILY POST (oude daily na 10 sec weg) ==================
+# ================== DAILY POST ==================
 async def daily_post_loop(app: Application):
     last_msg_id = None
 
@@ -307,14 +287,12 @@ async def daily_post_loop(app: Application):
             PHOTO_PATH, WELCOME_TEXT, build_keyboard()
         )
 
-        # ✅ alleen het vorige daily bericht verwijderen na 10 sec
         if last_msg_id:
             asyncio.create_task(
                 delete_later(app.bot, CHAT_ID, last_msg_id, DELETE_DAILY_SECONDS)
             )
         last_msg_id = msg.message_id
 
-        # pinnen
         try:
             await app.bot.pin_chat_message(chat_id=CHAT_ID, message_id=msg.message_id)
         except Exception:
@@ -322,37 +300,20 @@ async def daily_post_loop(app: Application):
 
         await asyncio.sleep(DAILY_SECONDS)
 
-# ================== VERIFY EVERY 2 HOURS (blijft staan) ==================
+# ================== VERIFY LOOP ==================
 async def verify_random_joiner_loop(app: Application):
     while True:
-        ensure_cycle_is_current()
-
-        available = [n for n in JOINED_NAMES if n and (n not in USED_NAMES)]
+        available = [n for n in JOINED_NAMES if n]
         if available:
             name = random.choice(available)
-            await send_text(app.bot, CHAT_ID, VERIFY_THREAD_ID, unlocked_text(name))
-            mark_used(name)
+            if not await db_is_used(name):
+                await send_text(app.bot, CHAT_ID, VERIFY_THREAD_ID, unlocked_text(name))
+                await db_mark_used(name)
 
         await asyncio.sleep(VERIFY_SECONDS)
 
-# ================== IMPROVED RANDOM ALIAS GENERATOR ==================
-NL_CITY_CODES = [
-    "010",  # Rotterdam
-    "020",  # Amsterdam
-    "030",  # Utrecht
-    "040",  # Eindhoven
-    "050",  # Groningen
-    "070",  # Den Haag
-    "073",  # Den Bosch
-    "076",  # Breda
-    "079",  # Zoetermeer
-    "071",  # Leiden
-    "072",  # Alkmaar
-    "074",  # Hengelo
-    "075",  # Zaandam
-    "078",  # Dordrecht
-]
-
+# ================== ALIAS GENERATOR (jouw originele) ==================
+NL_CITY_CODES = ["010","020","030","040","050","070","073","076","079","071","072","074","075","078"]
 SEPARATORS = ["_", ".", "-"]
 PREFIXES = ["x", "mr", "its", "real", "official", "the", "iam", "nl", "dm", "vip", "urban", "city", "only"]
 EMOJIS = ["🔥", "💎", "👻", "⚡", "🚀", "✅"]
@@ -361,7 +322,6 @@ def _name_fragments_from_joined():
     frags = []
     for n in JOINED_NAMES:
         n = (n or "").strip().lower()
-        # alleen letters
         n = "".join(ch for ch in n if ch.isalpha())
         if len(n) >= 4:
             for _ in range(2):
@@ -373,15 +333,6 @@ def _name_fragments_from_joined():
     return frags
 
 def random_alias_from_joined():
-    """
-    Maakt echt random aliassen:
-    - NL netnummer / stads-code erin
-    - prefix erin
-    - 2 fragments uit opgeslagen namen (niet 1 naam copy/paste)
-    - cijfers 2-4
-    - separator mix
-    - soms emoji achteraan
-    """
     frags = _name_fragments_from_joined()
     if not frags:
         frags = ["nova", "sky", "dex", "luna", "vex", "rio", "mira", "zen"]
@@ -423,15 +374,14 @@ def random_alias_from_joined():
         base = f"user{sep}{digits}"
     return base
 
-# ================== ACTIVITY LOOP (delete na 15 sec) ==================
+# ================== ACTIVITY LOOP ==================
 async def activity_loop(app: Application):
     while True:
         alias = random_alias_from_joined()
-        text = f"{alias} Successfully unlocked the group✅"   # <- pas dit aan als je wil
+        text = f"{alias} Successfully unlocked the group✅"
 
         msg = await send_text(app.bot, CHAT_ID, VERIFY_THREAD_ID, text)
 
-        # ✅ alleen deze messages na 15 sec verwijderen
         asyncio.create_task(
             delete_later(app.bot, CHAT_ID, msg.message_id, DELETE_LEAVE_SECONDS)
         )
@@ -440,14 +390,14 @@ async def activity_loop(app: Application):
 
 # ================== INIT ==================
 async def post_init(app: Application):
-    ensure_cycle_is_current()
+    await db_init()                           # ✅ nieuw
+    await db_load_joined_names_into_memory()  # ✅ nieuw (laad namen bij start)
+
     asyncio.create_task(reset_loop())
+    asyncio.create_task(cleanup_verify_topic_loop(app))  # ✅ 05:00 cleanup
     asyncio.create_task(daily_post_loop(app))
     asyncio.create_task(verify_random_joiner_loop(app))
     asyncio.create_task(activity_loop(app))
-
-    # ✅ 05:00 cleanup loop (TOEGEVOEGD)
-    asyncio.create_task(cleanup_verify_topic_loop(app))
 
 def main():
     app = Application.builder().token(TOKEN).post_init(post_init).build()
