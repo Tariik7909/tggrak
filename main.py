@@ -4,7 +4,7 @@ import random
 import logging
 import string
 import time as _time
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, date
 from zoneinfo import ZoneInfo
 
 import asyncpg
@@ -17,7 +17,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from telegram.error import RetryAfter, TimedOut, NetworkError, Forbidden, BadRequest
+from telegram.error import RetryAfter, TimedOut, NetworkError, Forbidden, BadRequest, Conflict
 
 logging.basicConfig(level=logging.INFO)
 
@@ -26,14 +26,17 @@ TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 TZ = ZoneInfo("Europe/Amsterdam")
-RESET_AT = time(5, 0)
+RESET_AT = time(5, 0)  # 05:00 Amsterdam boundary
 
+# ✅ Let op: alleen cijfers
 CHAT_ID = -1003328329377
+
 DAILY_THREAD_ID = None
 VERIFY_THREAD_ID = 4
 
 PHOTO_PATH = "banner.jpg"
 
+# TEST intervals (seconds)
 DAILY_SECONDS = 17
 VERIFY_SECONDS = 15
 JOIN_DELAY_SECONDS = 5 * 60
@@ -42,22 +45,37 @@ ACTIVITY_SECONDS = 15
 DELETE_DAILY_SECONDS = 34
 DELETE_LEAVE_SECONDS = 10000 * 6000
 
+# ===== OPTIE B: prune verify-message logging =====
+BOT_MSG_RETENTION_DAYS = 2
+BOT_MSG_MAX_ROWS = 20000
+BOT_MSG_PRUNE_EVERY = 200
+BOT_MSG_PRUNE_COUNTER = 0
+
+# ===== ENABLE FLAGS via Railway Variables =====
 ENABLE_DAILY = os.getenv("ENABLE_DAILY", "1") == "1"
 ENABLE_VERIFY = os.getenv("ENABLE_VERIFY", "1") == "1"
 ENABLE_ACTIVITY = os.getenv("ENABLE_ACTIVITY", "1") == "1"
 ENABLE_CLEANUP = os.getenv("ENABLE_CLEANUP", "1") == "1"
 
-TELEGRAM_PAUSE_UNTIL = 0.0
+# ===== Telegram circuit breaker =====
+TELEGRAM_PAUSE_UNTIL = 0.0  # epoch seconds
 
+# ===== SINGLE INSTANCE LOCK (Postgres advisory lock) =====
+# Kies een vaste integer. (Mag ook gebaseerd op CHAT_ID, maar fixed is prima.)
+PG_ADVISORY_LOCK_KEY = 88442211
+
+# ================== DB GLOBALS ==================
 DB_POOL: asyncpg.Pool | None = None
 JOINED_NAMES: list[str] = []
+LOCK_ACQUIRED = False
 
 # ================== CONTENT ==================
 WELCOME_TEXT = (
     "Welcome to THE 18+ HUB Telegram group 😈\n\n"
     "⚠️ To be admitted to the group, please share the link!\n"
     "Also, confirm you're not a bot by clicking the \"Open group✅\" button\n"
-    "below, and invite 5 people by sharing the link with them."
+    "below, and invite 5 people by sharing the link with them – via TELEGRAM "
+    "REDDIT.COM or X.COM"
 )
 
 SHARE_URL = (
@@ -74,7 +92,7 @@ def build_keyboard():
 def unlocked_text(name: str) -> str:
     return f"{name} Successfully unlocked the group✅"
 
-# ================== HELPERS ==================
+# ================== SAFETY: TASK CRASH LOGGING ==================
 def safe_create_task(coro, name: str):
     task = asyncio.create_task(coro)
 
@@ -87,18 +105,22 @@ def safe_create_task(coro, name: str):
     task.add_done_callback(_done)
     return task
 
-# ================== CYCLE FIX (BELANGRIJK) ==================
-def current_cycle_id(now: datetime):
+# ================== CYCLE HELPERS ==================
+def current_cycle_id(now: datetime) -> date:
+    """
+    Return een python date (NIET string), zodat asyncpg happy is met DATE.
+    Cycle boundary = 05:00 Amsterdam.
+    """
     local = now.astimezone(TZ)
     if local.time() < RESET_AT:
-        return local.date() - timedelta(days=1)
+        return (local.date() - timedelta(days=1))
     return local.date()
 
 # ================== DB ==================
 async def db_init():
     global DB_POOL
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL ontbreekt")
+        raise RuntimeError("DATABASE_URL ontbreekt. Zet DATABASE_URL in je BOT service variables.")
 
     DB_POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
 
@@ -118,98 +140,468 @@ async def db_init():
         );
         """)
 
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS bot_verify_messages (
+            message_id BIGINT PRIMARY KEY,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """)
+
+        await conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_bot_verify_messages_created_at
+        ON bot_verify_messages(created_at);
+        """)
+
     logging.info("DB initialized ok")
+
+async def db_acquire_single_instance_lock():
+    """
+    Voorkomt dat Railway (rolling deploy / restart) 2 instances tegelijk poll-en.
+    Als lock niet lukt -> exit container (zodat maar 1 instance overblijft).
+    """
+    global LOCK_ACQUIRED
+    if DB_POOL is None:
+        raise RuntimeError("DB_POOL is None in db_acquire_single_instance_lock()")
+
+    async with DB_POOL.acquire() as conn:
+        got = await conn.fetchval("SELECT pg_try_advisory_lock($1);", PG_ADVISORY_LOCK_KEY)
+
+    if not got:
+        logging.error(
+            "❌ Another instance holds the polling lock (pg_try_advisory_lock=%s). "
+            "Stopping THIS instance to avoid 409 Conflict.",
+            PG_ADVISORY_LOCK_KEY
+        )
+        # Hard stop: laat Railway deze container killen
+        raise SystemExit(0)
+
+    LOCK_ACQUIRED = True
+    logging.info("✅ Acquired single-instance polling lock (%s)", PG_ADVISORY_LOCK_KEY)
 
 async def db_load_joined_names_into_memory():
     global JOINED_NAMES
+    if DB_POOL is None:
+        raise RuntimeError("DB_POOL is None in db_load_joined_names_into_memory()")
+
     async with DB_POOL.acquire() as conn:
-        rows = await conn.fetch("SELECT name FROM joined_names;")
+        rows = await conn.fetch("SELECT name FROM joined_names ORDER BY first_seen ASC;")
     JOINED_NAMES = [r["name"] for r in rows]
+    logging.info("Loaded %d joined names from DB", len(JOINED_NAMES))
 
 async def db_remember_joined_name(name: str):
-    if not DB_POOL:
+    global JOINED_NAMES
+    name = (name or "").strip()
+    if not name:
         return
-    name = name.strip()
-    async with DB_POOL.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO joined_names(name) VALUES($1) ON CONFLICT DO NOTHING;",
-            name
-        )
+    if DB_POOL is None:
+        logging.warning("DB_POOL not ready yet; skip remember name")
+        return
+
+    for attempt in range(3):
+        try:
+            async with DB_POOL.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO joined_names(name) VALUES($1) ON CONFLICT (name) DO NOTHING;",
+                    name
+                )
+            break
+        except Exception:
+            logging.exception("DB remember name failed attempt=%s", attempt + 1)
+            await asyncio.sleep(1 + attempt)
+
     if name not in JOINED_NAMES:
         JOINED_NAMES.append(name)
 
 async def db_is_used(name: str) -> bool:
-    cid = current_cycle_id(datetime.now(TZ))
+    if DB_POOL is None:
+        return False
+
+    cid = current_cycle_id(datetime.now(TZ))  # python date
     async with DB_POOL.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT 1 FROM used_names WHERE cycle_id=$1 AND name=$2;",
+            "SELECT 1 FROM used_names WHERE cycle_id = $1 AND name = $2 LIMIT 1;",
             cid, name
         )
     return row is not None
 
 async def db_mark_used(name: str):
-    cid = current_cycle_id(datetime.now(TZ))
-    async with DB_POOL.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO used_names(cycle_id, name) VALUES($1,$2) ON CONFLICT DO NOTHING;",
-            cid, name
-        )
+    if DB_POOL is None:
+        return
 
-# ================== TELEGRAM SAFE SEND ==================
-async def safe_send(coro_factory):
+    cid = current_cycle_id(datetime.now(TZ))  # python date
+    for attempt in range(3):
+        try:
+            async with DB_POOL.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO used_names(cycle_id, name) VALUES($1, $2) ON CONFLICT DO NOTHING;",
+                    cid, name
+                )
+            return
+        except Exception:
+            logging.exception("DB mark used failed attempt=%s", attempt + 1)
+            await asyncio.sleep(1 + attempt)
+
+async def db_track_bot_verify_message_id(message_id: int):
+    global BOT_MSG_PRUNE_COUNTER
+    if DB_POOL is None:
+        return
+
+    for attempt in range(3):
+        try:
+            async with DB_POOL.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO bot_verify_messages(message_id) VALUES($1) ON CONFLICT DO NOTHING;",
+                    int(message_id)
+                )
+
+                BOT_MSG_PRUNE_COUNTER += 1
+                if BOT_MSG_PRUNE_COUNTER % BOT_MSG_PRUNE_EVERY != 0:
+                    return
+
+                await conn.execute(
+                    f"DELETE FROM bot_verify_messages "
+                    f"WHERE created_at < NOW() - INTERVAL '{BOT_MSG_RETENTION_DAYS} days';"
+                )
+
+                await conn.execute(
+                    """
+                    DELETE FROM bot_verify_messages
+                    WHERE message_id IN (
+                        SELECT message_id
+                        FROM bot_verify_messages
+                        ORDER BY created_at DESC
+                        OFFSET $1
+                    );
+                    """,
+                    BOT_MSG_MAX_ROWS
+                )
+            return
+        except Exception:
+            logging.exception("DB track bot message failed attempt=%s", attempt + 1)
+            await asyncio.sleep(1 + attempt)
+
+# ================== TELEGRAM SEND (MAX RETRIES + CIRCUIT BREAKER) ==================
+async def safe_send(coro_factory, what: str, max_retries: int = 5):
     global TELEGRAM_PAUSE_UNTIL
-    if _time.time() < TELEGRAM_PAUSE_UNTIL:
+
+    now = _time.time()
+    if now < TELEGRAM_PAUSE_UNTIL:
+        wait = int(TELEGRAM_PAUSE_UNTIL - now)
+        logging.warning("%s skipped, Telegram paused for %ss", what, wait)
         return None
 
-    try:
-        return await coro_factory()
-    except (RetryAfter, TimedOut, NetworkError):
-        TELEGRAM_PAUSE_UNTIL = _time.time() + 60
-    except (Forbidden, BadRequest):
-        return None
+    failures = 0
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            return await coro_factory()
+        except RetryAfter as e:
+            sleep_s = e.retry_after + 1
+            logging.warning("%s rate limited. Sleep %ss (attempt %s/%s)", what, sleep_s, attempt, max_retries)
+            await asyncio.sleep(sleep_s)
+        except (TimedOut, NetworkError) as e:
+            failures += 1
+            backoff = min(30, 2 ** attempt)  # 2,4,8,16,30
+            logging.warning("%s transient network error: %s. backoff %ss (attempt %s/%s)", what, e, backoff, attempt, max_retries)
+            await asyncio.sleep(backoff)
+        except Forbidden as e:
+            logging.exception("%s forbidden (rights/bot kicked?): %s", what, e)
+            return None
+        except BadRequest as e:
+            logging.exception("%s bad request: %s", what, e)
+            return None
+        except Exception as e:
+            logging.exception("%s unexpected error: %s", what, e)
+            await asyncio.sleep(2)
+
+    if failures >= 3:
+        TELEGRAM_PAUSE_UNTIL = _time.time() + 300  # 5 min
+        logging.error("Telegram lijkt onbereikbaar. Pauzeer sends voor 5 minuten.")
+
+    logging.error("%s failed after %s retries - skipping", what, max_retries)
+    return None
+
+async def delete_later(bot, chat_id, message_id, delay_seconds: int):
+    await asyncio.sleep(delay_seconds)
+    await safe_send(lambda: bot.delete_message(chat_id=chat_id, message_id=message_id), "delete_message")
+
+async def send_text(bot, chat_id, thread_id, text):
+    if thread_id is None:
+        return await safe_send(lambda: bot.send_message(chat_id=chat_id, text=text), "send_message(main)")
+
+    msg = await safe_send(
+        lambda: bot.send_message(chat_id=chat_id, message_thread_id=thread_id, text=text),
+        f"send_message(thread={thread_id})"
+    )
+
+    if msg and thread_id == VERIFY_THREAD_ID:
+        await db_track_bot_verify_message_id(msg.message_id)
+
+    return msg
+
+async def send_photo(bot, chat_id, thread_id, photo_path, caption, reply_markup):
+    with open(photo_path, "rb") as photo:
+        if thread_id is None:
+            msg = await safe_send(
+                lambda: bot.send_photo(
+                    chat_id=chat_id,
+                    photo=photo,
+                    caption=caption,
+                    reply_markup=reply_markup,
+                    has_spoiler=True
+                ),
+                "send_photo(main)"
+            )
+        else:
+            msg = await safe_send(
+                lambda: bot.send_photo(
+                    chat_id=chat_id,
+                    message_thread_id=thread_id,
+                    photo=photo,
+                    caption=caption,
+                    reply_markup=reply_markup,
+                    has_spoiler=True
+                ),
+                f"send_photo(thread={thread_id})"
+            )
+
+    if msg and thread_id == VERIFY_THREAD_ID:
+        await db_track_bot_verify_message_id(msg.message_id)
+
+    return msg
 
 # ================== LOOPS ==================
+async def reset_loop():
+    while True:
+        now = datetime.now(TZ)
+        target = datetime.combine(now.date(), RESET_AT, tzinfo=TZ)
+        if now >= target:
+            target = target + timedelta(days=1)
+
+        await asyncio.sleep(max(1, int((target - now).total_seconds())))
+        logging.info("Cycle boundary reached at 05:00")
+
+async def cleanup_verify_topic_loop(app: Application):
+    while True:
+        now = datetime.now(TZ)
+        target = datetime.combine(now.date(), RESET_AT, tzinfo=TZ)
+        if now >= target:
+            target = target + timedelta(days=1)
+
+        await asyncio.sleep(max(1, int((target - now).total_seconds())))
+
+        if DB_POOL is None:
+            continue
+
+        async with DB_POOL.acquire() as conn:
+            rows = await conn.fetch("SELECT message_id FROM bot_verify_messages;")
+
+        ids = [int(r["message_id"]) for r in rows]
+        kept = []
+
+        for mid in ids:
+            ok = await safe_send(
+                lambda: app.bot.delete_message(chat_id=CHAT_ID, message_id=mid),
+                "cleanup_delete_message"
+            )
+            if ok is None:
+                kept.append(mid)
+
+        async with DB_POOL.acquire() as conn:
+            await conn.execute("TRUNCATE TABLE bot_verify_messages;")
+            if kept:
+                await conn.executemany(
+                    "INSERT INTO bot_verify_messages(message_id) VALUES($1) ON CONFLICT DO NOTHING;",
+                    [(m,) for m in kept]
+                )
+
+        logging.info("Cleanup verify-topic bot messages at 05:00 done. kept=%d", len(kept))
+
+async def daily_post_loop(app: Application):
+    last_msg_id = None
+
+    while True:
+        msg = await send_photo(
+            app.bot, CHAT_ID, DAILY_THREAD_ID,
+            PHOTO_PATH, WELCOME_TEXT, build_keyboard()
+        )
+
+        if last_msg_id:
+            safe_create_task(delete_later(app.bot, CHAT_ID, last_msg_id, DELETE_DAILY_SECONDS), "delete_old_daily")
+
+        if msg:
+            last_msg_id = msg.message_id
+            await safe_send(lambda: app.bot.pin_chat_message(chat_id=CHAT_ID, message_id=msg.message_id), "pin_chat_message")
+
+        await asyncio.sleep(DAILY_SECONDS)
+
 async def verify_random_joiner_loop(app: Application):
     while True:
         if JOINED_NAMES:
-            name = random.choice(JOINED_NAMES)
-            if not await db_is_used(name):
-                await safe_send(
-                    lambda: app.bot.send_message(
-                        chat_id=CHAT_ID,
-                        message_thread_id=VERIFY_THREAD_ID,
-                        text=unlocked_text(name)
-                    )
-                )
+            name = random.choice([n for n in JOINED_NAMES if n])
+            if name and (not await db_is_used(name)):
+                await send_text(app.bot, CHAT_ID, VERIFY_THREAD_ID, unlocked_text(name))
                 await db_mark_used(name)
+
         await asyncio.sleep(VERIFY_SECONDS)
+
+# ================== ALIAS GENERATOR ==================
+NL_CITY_CODES = ["010","020","030","040","050","070","073","076","079","071","072","074","075","078"]
+SEPARATORS = ["_", ".", "-"]
+PREFIXES = ["x", "mr", "its", "real", "official", "the", "iam", "nl", "dm", "vip", "urban", "city", "only"]
+EMOJIS = ["🔥", "💎", "👻", "⚡", "🚀", "✅"]
+
+def _name_fragments_from_joined():
+    frags = []
+    for n in JOINED_NAMES:
+        n = (n or "").strip().lower()
+        n = "".join(ch for ch in n if ch.isalpha())
+        if len(n) >= 4:
+            for _ in range(2):
+                start = random.randint(0, max(0, len(n) - 3))
+                frag_len = random.randint(2, 4)
+                frag = n[start:start+frag_len]
+                if frag and frag not in frags:
+                    frags.append(frag)
+    return frags
+
+def random_alias_from_joined():
+    frags = _name_fragments_from_joined()
+    if not frags:
+        frags = ["nova", "sky", "dex", "luna", "vex", "rio", "mira", "zen"]
+
+    code = random.choice(NL_CITY_CODES)
+    sep = random.choice(SEPARATORS)
+    prefix = random.choice(PREFIXES)
+    frag1 = random.choice(frags)
+    frag2 = random.choice(frags)
+    while frag2 == frag1:
+        frag2 = random.choice(frags)
+
+    digits = "".join(random.choices(string.digits, k=random.randint(2, 4)))
+
+    style = random.choice([
+        "prefix_frag_digits",
+        "frag_code_digits",
+        "frag_frag_digits",
+        "prefix_frag_code",
+        "prefix_frag_sep_frag_digits",
+        "frag_digits_emoji",
+    ])
+
+    if style == "prefix_frag_digits":
+        base = f"{prefix}{sep}{frag1}{digits}"
+    elif style == "frag_code_digits":
+        base = f"{frag1}{sep}{code}{sep}{digits}"
+    elif style == "frag_frag_digits":
+        base = f"{frag1}{sep}{frag2}{digits}"
+    elif style == "prefix_frag_code":
+        base = f"{prefix}{sep}{frag1}{sep}{code}"
+    elif style == "frag_digits_emoji":
+        base = f"{frag1}{digits}{random.choice(EMOJIS)}"
+    else:
+        base = f"{prefix}{sep}{frag1}{sep}{frag2}{sep}{digits}"
+
+    base = base.strip()
+    if not base or base.isdigit():
+        base = f"user{sep}{digits}"
+    return base
+
+async def activity_loop(app: Application):
+    while True:
+        alias = random_alias_from_joined()
+        text = f"{alias} Successfully unlocked the group✅"
+
+        msg = await send_text(app.bot, CHAT_ID, VERIFY_THREAD_ID, text)
+
+        if msg:
+            safe_create_task(delete_later(app.bot, CHAT_ID, msg.message_id, DELETE_LEAVE_SECONDS), "delete_activity_msg")
+
+        await asyncio.sleep(ACTIVITY_SECONDS)
 
 # ================== HANDLERS ==================
 async def on_open_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer(
-        "You need to share the group first.",
+        "Can’t acces the group, because unfortunately you haven’t shared the group 3 times yet.",
         show_alert=True
     )
 
-async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != CHAT_ID:
+async def announce_join_after_delay(context: ContextTypes.DEFAULT_TYPE, name: str):
+    await asyncio.sleep(JOIN_DELAY_SECONDS)
+    name = (name or "").strip()
+    if not name:
         return
-    for m in update.message.new_chat_members:
-        await db_remember_joined_name(m.full_name)
+
+    if await db_is_used(name):
+        return
+
+    await send_text(context.bot, CHAT_ID, VERIFY_THREAD_ID, unlocked_text(name))
+    await db_mark_used(name)
+
+async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.new_chat_members:
+        return
+    if not update.effective_chat or update.effective_chat.id != CHAT_ID:
+        return
+
+    for member in update.message.new_chat_members:
+        name = (member.full_name or "").strip()
+        if name:
+            await db_remember_joined_name(name)
+            safe_create_task(announce_join_after_delay(context, name), f"announce_join_after_delay({name})")
+
+# ================== ERROR HANDLER ==================
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    err = context.error
+    if isinstance(err, Conflict):
+        logging.error("409 Conflict: er draait (heel kort) een andere polling instance. Advisory lock voorkomt dit.")
+        return
+    logging.exception("Unhandled error", exc_info=err)
 
 # ================== INIT ==================
 async def post_init(app: Application):
+    me = await app.bot.get_me()
+    logging.info("Bot started: @%s", me.username)
+
     await db_init()
+    await db_acquire_single_instance_lock()
     await db_load_joined_names_into_memory()
 
+    ok = await safe_send(lambda: app.bot.send_message(chat_id=CHAT_ID, text="✅ bot gestart (startup test)"), "startup_test")
+    if ok is None:
+        logging.error("Startup test failed - check CHAT_ID, bot rights, Telegram connectivity from Railway.")
+
+    safe_create_task(reset_loop(), "reset_loop")
+
+    if ENABLE_CLEANUP:
+        safe_create_task(cleanup_verify_topic_loop(app), "cleanup_verify_topic_loop")
+    else:
+        logging.info("ENABLE_CLEANUP=0 -> cleanup disabled")
+
+    if ENABLE_DAILY:
+        safe_create_task(daily_post_loop(app), "daily_post_loop")
+    else:
+        logging.info("ENABLE_DAILY=0 -> daily disabled")
+
     if ENABLE_VERIFY:
-        safe_create_task(verify_random_joiner_loop(app), "verify_loop")
+        safe_create_task(verify_random_joiner_loop(app), "verify_random_joiner_loop")
+    else:
+        logging.info("ENABLE_VERIFY=0 -> verify disabled")
+
+    if ENABLE_ACTIVITY:
+        safe_create_task(activity_loop(app), "activity_loop")
+    else:
+        logging.info("ENABLE_ACTIVITY=0 -> activity disabled")
 
 def main():
     app = Application.builder().token(TOKEN).post_init(post_init).build()
+
     app.add_handler(CallbackQueryHandler(on_open_group, pattern="^open_group$"))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
-    app.run_polling()
+    app.add_error_handler(on_error)
+
+    # drop_pending_updates True voorkomt oude backlog; poll_interval mag je houden
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
