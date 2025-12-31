@@ -12,16 +12,10 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# ---------------------------
-# Logging
-# ---------------------------
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bot")
 
 
-# ---------------------------
-# Config (Railway env vars)
-# ---------------------------
 def env_bool(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
     if v is None:
@@ -33,7 +27,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("Missing env var BOT_TOKEN")
 
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()  # Railway geeft deze
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if not DATABASE_URL:
     raise RuntimeError("Missing env var DATABASE_URL")
 
@@ -42,16 +36,12 @@ ENABLE_DAILY = env_bool("ENABLE_DAILY", False)
 ENABLE_ACTIVITY = env_bool("ENABLE_ACTIVITY", False)
 ENABLE_VERIFY = env_bool("ENABLE_VERIFY", True)
 
-# Polling (veiligere defaults)
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "1.0"))
 READ_TIMEOUT = float(os.getenv("READ_TIMEOUT", "30"))
 CONNECT_TIMEOUT = float(os.getenv("CONNECT_TIMEOUT", "15"))
 WRITE_TIMEOUT = float(os.getenv("WRITE_TIMEOUT", "30"))
 POOL_MIN = int(os.getenv("DB_POOL_MIN", "1"))
 POOL_MAX = int(os.getenv("DB_POOL_MAX", "5"))
-
-# Let op: die 409 Conflict komt meestal door 2 instanties tegelijk.
-# Dit helpt een beetje, maar de échte fix is "maar 1 instance" draaien.
 DROP_PENDING_UPDATES = env_bool("DROP_PENDING_UPDATES", True)
 
 log.info("ENABLE_CLEANUP=%s", int(ENABLE_CLEANUP))
@@ -60,15 +50,11 @@ log.info("ENABLE_ACTIVITY=%s", int(ENABLE_ACTIVITY))
 log.info("ENABLE_VERIFY=%s", int(ENABLE_VERIFY))
 
 
-# ---------------------------
-# Database helper
-# ---------------------------
 class Storage:
     def __init__(self) -> None:
         self.pool: asyncpg.Pool | None = None
 
     async def init_db(self) -> None:
-        # asyncpg gebruikt DATABASE_URL direct
         self.pool = await asyncpg.create_pool(
             dsn=DATABASE_URL,
             min_size=POOL_MIN,
@@ -91,14 +77,8 @@ class Storage:
             await self.pool.close()
 
     async def is_used_today(self, name: str) -> bool:
-        """
-        CHECK: is deze naam al gebruikt vandaag?
-        FIX voor jouw crash:
-        - asyncpg verwacht DATE type voor date-kolom
-        - dus NIET '2025-12-31' als string geven, maar date.today()
-        """
         assert self.pool is not None
-        today = date.today()  # <-- dit is een echte date, geen string
+        today = date.today()
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT 1 FROM used_names WHERE name=$1 AND used_on=$2;",
@@ -125,9 +105,6 @@ class Storage:
 st = Storage()
 
 
-# ---------------------------
-# Telegram handlers
-# ---------------------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("✅ Bot draait. Gebruik /ping of /used <naam>.")
 
@@ -150,18 +127,10 @@ async def used_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"✅ '{name}' gemarkeerd als gebruikt voor vandaag.")
 
 
-# ---------------------------
-# Background task (voorbeeld)
-# ---------------------------
 async def verify_random_joiner_loop(app: Application) -> None:
-    """
-    Alleen als ENABLE_VERIFY=1.
-    Dit is een voorbeeldloop. Vul hier je echte logic in.
-    """
     log.info("verify_random_joiner_loop started")
     while True:
         try:
-            # voorbeeld: elke 60 sec iets doen
             await asyncio.sleep(60)
             # ... jouw verify logic ...
         except asyncio.CancelledError:
@@ -172,16 +141,14 @@ async def verify_random_joiner_loop(app: Application) -> None:
             await asyncio.sleep(5)
 
 
-# ---------------------------
-# Main
-# ---------------------------
-async def main_async() -> None:
-    await st.init_db()
+def main() -> None:
+    # 1) DB init async, maar we doen het vóór run_polling
+    asyncio.run(st.init_db())
 
+    # 2) PTB app bouwen
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
-        # PTB timeouts (helpt tegen timeouts in logs)
         .read_timeout(READ_TIMEOUT)
         .write_timeout(WRITE_TIMEOUT)
         .connect_timeout(CONNECT_TIMEOUT)
@@ -192,29 +159,23 @@ async def main_async() -> None:
     app.add_handler(CommandHandler("ping", ping_cmd))
     app.add_handler(CommandHandler("used", used_cmd))
 
-    # background tasks starten nadat app gestart is
-    async def on_startup(_: Application) -> None:
+    # 3) Background task bij startup
+    async def post_init(a: Application) -> None:
         if ENABLE_VERIFY:
-            _.create_task(verify_random_joiner_loop(_))
+            a.create_task(verify_random_joiner_loop(a))
 
-    async def on_shutdown(_: Application) -> None:
-        await st.close()
+    app.post_init = post_init
 
-    app.post_init = on_startup
-    app.post_shutdown = on_shutdown
-
-    # Polling starten
-    # drop_pending_updates helpt “oude updates” weggooien na redeploy.
-    await app.run_polling(
-        poll_interval=POLL_INTERVAL,
-        drop_pending_updates=DROP_PENDING_UPDATES,
-        allowed_updates=Update.ALL_TYPES,
-        close_loop=False,
-    )
-
-
-def main() -> None:
-    asyncio.run(main_async())
+    # 4) run_polling is SYNC (laat PTB de eventloop beheren)
+    try:
+        app.run_polling(
+            poll_interval=POLL_INTERVAL,
+            drop_pending_updates=DROP_PENDING_UPDATES,
+            allowed_updates=Update.ALL_TYPES,
+        )
+    finally:
+        # net shutdown (db)
+        asyncio.run(st.close())
 
 
 if __name__ == "__main__":
