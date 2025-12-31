@@ -61,9 +61,9 @@ ENABLE_CLEANUP = os.getenv("ENABLE_CLEANUP", "1") == "1"
 # ===== Telegram circuit breaker =====
 TELEGRAM_PAUSE_UNTIL = 0.0  # epoch seconds
 
-# ===== Polling settings (optioneel via env) =====
+# ===== Polling settings =====
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "1.0"))
-DROP_PENDING_UPDATES = os.getenv("DROP_PENDING_UPDATES", "0") == "1"
+DROP_PENDING_UPDATES = os.getenv("DROP_PENDING_UPDATES", "1") == "1"  # ✅ default ON
 
 # ================== DB GLOBALS ==================
 DB_POOL: asyncpg.Pool | None = None
@@ -173,8 +173,14 @@ async def db_load_joined_names_into_memory():
     logging.info("Loaded %d joined names from DB", len(JOINED_NAMES))
 
 async def db_remember_joined_name(name: str):
+    global DB_POOL
     name = (name or "").strip()
     if not name:
+        return
+
+    # ✅ extra guard (moet eigenlijk nooit meer gebeuren, maar wel veilig)
+    if DB_POOL is None:
+        logging.warning("DB_POOL is None, skip remember_joined_name for now")
         return
 
     for attempt in range(3):
@@ -230,13 +236,11 @@ async def db_track_bot_verify_message_id(message_id: int):
                 if BOT_MSG_PRUNE_COUNTER % BOT_MSG_PRUNE_EVERY != 0:
                     return
 
-                # retention
                 await conn.execute(
                     f"DELETE FROM bot_verify_messages "
                     f"WHERE created_at < NOW() - INTERVAL '{BOT_MSG_RETENTION_DAYS} days';"
                 )
 
-                # cap rows
                 await conn.execute(
                     """
                     DELETE FROM bot_verify_messages
@@ -256,10 +260,6 @@ async def db_track_bot_verify_message_id(message_id: int):
 
 # ================== TELEGRAM SEND (MAX RETRIES + CIRCUIT BREAKER) ==================
 async def safe_send(coro_factory, what: str, max_retries: int = 5):
-    """
-    - Max retries + exponential backoff
-    - Circuit breaker: als Telegram onbereikbaar lijkt, pauzeer 5 min.
-    """
     global TELEGRAM_PAUSE_UNTIL
 
     now = _time.time()
@@ -279,11 +279,8 @@ async def safe_send(coro_factory, what: str, max_retries: int = 5):
             await asyncio.sleep(sleep_s)
         except (TimedOut, NetworkError) as e:
             failures += 1
-            backoff = min(30, 2 ** attempt)  # 2,4,8,16,30
-            logging.warning(
-                "%s transient network error: %s. backoff %ss (attempt %s/%s)",
-                what, e, backoff, attempt, max_retries
-            )
+            backoff = min(30, 2 ** attempt)
+            logging.warning("%s transient network error: %s. backoff %ss (attempt %s/%s)", what, e, backoff, attempt, max_retries)
             await asyncio.sleep(backoff)
         except Forbidden as e:
             logging.exception("%s forbidden (rights/bot kicked?): %s", what, e)
@@ -295,9 +292,8 @@ async def safe_send(coro_factory, what: str, max_retries: int = 5):
             logging.exception("%s unexpected error: %s", what, e)
             await asyncio.sleep(2)
 
-    # circuit breaker
     if failures >= 3:
-        TELEGRAM_PAUSE_UNTIL = _time.time() + 300  # 5 min
+        TELEGRAM_PAUSE_UNTIL = _time.time() + 300
         logging.error("Telegram lijkt onbereikbaar. Pauzeer sends voor 5 minuten.")
 
     logging.error("%s failed after %s retries - skipping", what, max_retries)
@@ -529,15 +525,14 @@ async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await db_remember_joined_name(name)
             safe_create_task(announce_join_after_delay(context, name), f"announce_join_after_delay({name})")
 
-# ================== INIT ==================
-async def post_init(app: Application):
+# ================== STARTUP (DB + LOOPS) ==================
+async def startup(app: Application):
     me = await app.bot.get_me()
     logging.info("Bot started: @%s", me.username)
 
     await db_init()
     await db_load_joined_names_into_memory()
 
-    # Startup test
     ok = await safe_send(lambda: app.bot.send_message(chat_id=CHAT_ID, text="✅ bot gestart (startup test)"), "startup_test")
     if ok is None:
         logging.error("Startup test failed - check CHAT_ID, bot rights, Telegram connectivity from Railway.")
@@ -564,7 +559,7 @@ async def post_init(app: Application):
     else:
         logging.info("ENABLE_ACTIVITY=0 -> activity disabled")
 
-# ================== ASYNC RUN (OPLOSSING 1) ==================
+# ================== ASYNC RUN ==================
 async def run_bot(app: Application):
     stop_event = asyncio.Event()
 
@@ -577,6 +572,9 @@ async def run_bot(app: Application):
 
     await app.initialize()
     await app.start()
+
+    # ✅ SUPER BELANGRIJK: eerst DB init + loops, pas daarna polling
+    await startup(app)
 
     await app.updater.start_polling(
         poll_interval=POLL_INTERVAL,
@@ -604,7 +602,7 @@ async def main():
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN ontbreekt. Zet BOT_TOKEN in je BOT service variables.")
 
-    app = Application.builder().token(TOKEN).post_init(post_init).build()
+    app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CallbackQueryHandler(on_open_group, pattern="^open_group$"))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
