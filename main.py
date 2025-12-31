@@ -1,182 +1,622 @@
 import os
 import asyncio
+import random
 import logging
-from datetime import date, datetime, timezone
+import string
+import time as _time
+import signal
+from datetime import datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 import asyncpg
-from telegram import Update
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
-    ApplicationBuilder,
-    CommandHandler,
     ContextTypes,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
 )
+from telegram.error import RetryAfter, TimedOut, NetworkError, Forbidden, BadRequest
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("bot")
 
+# ================== CONFIG ==================
+TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-def env_bool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return v.strip().lower() in ("1", "true", "yes", "y", "on")
+TZ = ZoneInfo("Europe/Amsterdam")
+RESET_AT = time(5, 0)  # 05:00 Amsterdam boundary
 
+# ✅ Let op: alleen cijfers
+CHAT_ID = -1003328329377
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-if not BOT_TOKEN:
-    raise RuntimeError("Missing env var BOT_TOKEN")
+DAILY_THREAD_ID = None
+VERIFY_THREAD_ID = 4
 
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-if not DATABASE_URL:
-    raise RuntimeError("Missing env var DATABASE_URL")
+PHOTO_PATH = "banner.jpg"
 
-ENABLE_CLEANUP = env_bool("ENABLE_CLEANUP", False)
-ENABLE_DAILY = env_bool("ENABLE_DAILY", False)
-ENABLE_ACTIVITY = env_bool("ENABLE_ACTIVITY", False)
-ENABLE_VERIFY = env_bool("ENABLE_VERIFY", True)
+# TEST intervals (seconds)
+DAILY_SECONDS = 17
+VERIFY_SECONDS = 15
+JOIN_DELAY_SECONDS = 5 * 60
+ACTIVITY_SECONDS = 15
 
+DELETE_DAILY_SECONDS = 34
+DELETE_LEAVE_SECONDS = 10000 * 6000
+
+# ===== OPTIE B: prune verify-message logging =====
+BOT_MSG_RETENTION_DAYS = 2
+BOT_MSG_MAX_ROWS = 20000
+BOT_MSG_PRUNE_EVERY = 200
+BOT_MSG_PRUNE_COUNTER = 0
+
+# ===== ENABLE FLAGS via Railway Variables =====
+ENABLE_DAILY = os.getenv("ENABLE_DAILY", "1") == "1"
+ENABLE_VERIFY = os.getenv("ENABLE_VERIFY", "1") == "1"
+ENABLE_ACTIVITY = os.getenv("ENABLE_ACTIVITY", "1") == "1"
+ENABLE_CLEANUP = os.getenv("ENABLE_CLEANUP", "1") == "1"
+
+# ===== Telegram circuit breaker =====
+TELEGRAM_PAUSE_UNTIL = 0.0  # epoch seconds
+
+# ===== Polling settings (optioneel via env) =====
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "1.0"))
-READ_TIMEOUT = float(os.getenv("READ_TIMEOUT", "30"))
-CONNECT_TIMEOUT = float(os.getenv("CONNECT_TIMEOUT", "15"))
-WRITE_TIMEOUT = float(os.getenv("WRITE_TIMEOUT", "30"))
-POOL_MIN = int(os.getenv("DB_POOL_MIN", "1"))
-POOL_MAX = int(os.getenv("DB_POOL_MAX", "5"))
-DROP_PENDING_UPDATES = env_bool("DROP_PENDING_UPDATES", True)
+DROP_PENDING_UPDATES = os.getenv("DROP_PENDING_UPDATES", "0") == "1"
 
-log.info("ENABLE_CLEANUP=%s", int(ENABLE_CLEANUP))
-log.info("ENABLE_DAILY=%s", int(ENABLE_DAILY))
-log.info("ENABLE_ACTIVITY=%s", int(ENABLE_ACTIVITY))
-log.info("ENABLE_VERIFY=%s", int(ENABLE_VERIFY))
+# ================== DB GLOBALS ==================
+DB_POOL: asyncpg.Pool | None = None
+JOINED_NAMES: list[str] = []
 
+# ================== TASK TRACKING ==================
+BACKGROUND_TASKS: list[asyncio.Task] = []
 
-class Storage:
-    def __init__(self) -> None:
-        self.pool: asyncpg.Pool | None = None
+# ================== CONTENT ==================
+WELCOME_TEXT = (
+    "Welcome to THE 18+ HUB Telegram group 😈\n\n"
+    "⚠️ To be admitted to the group, please share the link!\n"
+    "Also, confirm you're not a bot by clicking the \"Open group✅\" button\n"
+    "below, and invite 5 people by sharing the link with them – via TELEGRAM "
+    "REDDIT.COM or X.COM"
+)
 
-    async def init_db(self) -> None:
-        self.pool = await asyncpg.create_pool(
-            dsn=DATABASE_URL,
-            min_size=POOL_MIN,
-            max_size=POOL_MAX,
-            command_timeout=30,
-        )
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS used_names (
-                    name TEXT PRIMARY KEY,
-                    used_on DATE NOT NULL
-                );
-                """
-            )
-        log.info("DB initialized ok")
+SHARE_URL = (
+    "https://t.me/share/url?url=%20all%20exclusive%E2%80%94content%20"
+    "https%3A%2F%2Ft.me%2F%2BAiDsi2LccXJmMjlh"
+)
 
-    async def close(self) -> None:
-        if self.pool:
-            await self.pool.close()
+def build_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📤 0/3", url=SHARE_URL)],
+        [InlineKeyboardButton("Open group✅", callback_data="open_group")]
+    ])
 
-    async def is_used_today(self, name: str) -> bool:
-        assert self.pool is not None
-        today = date.today()
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT 1 FROM used_names WHERE name=$1 AND used_on=$2;",
-                name,
-                today,
-            )
-        return row is not None
+def unlocked_text(name: str) -> str:
+    return f"{name} Successfully unlocked the group✅"
 
-    async def mark_used_today(self, name: str) -> None:
-        assert self.pool is not None
-        today = date.today()
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO used_names(name, used_on)
-                VALUES ($1, $2)
-                ON CONFLICT (name) DO UPDATE SET used_on=EXCLUDED.used_on;
-                """,
-                name,
-                today,
-            )
+# ================== SAFETY: TASK CRASH LOGGING ==================
+def safe_create_task(coro, name: str):
+    task = asyncio.create_task(coro, name=name)
+    BACKGROUND_TASKS.append(task)
 
-
-st = Storage()
-
-
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("✅ Bot draait. Gebruik /ping of /used <naam>.")
-
-
-async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    await update.message.reply_text(f"pong 🟢 {now}")
-
-
-async def used_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.message.reply_text("Gebruik: /used <naam>")
-        return
-    name = " ".join(context.args).strip()
-    used = await st.is_used_today(name)
-    if used:
-        await update.message.reply_text(f"⚠️ '{name}' is AL gebruikt vandaag.")
-    else:
-        await st.mark_used_today(name)
-        await update.message.reply_text(f"✅ '{name}' gemarkeerd als gebruikt voor vandaag.")
-
-
-async def verify_random_joiner_loop(app: Application) -> None:
-    log.info("verify_random_joiner_loop started")
-    while True:
+    def _done(t: asyncio.Task):
         try:
-            await asyncio.sleep(60)
-            # ... jouw verify logic ...
+            t.result()
         except asyncio.CancelledError:
-            log.info("verify_random_joiner_loop cancelled")
-            raise
+            pass
         except Exception:
-            log.exception("verify_random_joiner_loop crashed (will continue)")
-            await asyncio.sleep(5)
+            logging.exception("Task crashed: %s", name)
 
+    task.add_done_callback(_done)
+    return task
 
-def main() -> None:
-    # 1) DB init async, maar we doen het vóór run_polling
-    asyncio.run(st.init_db())
+# ================== CYCLE HELPERS ==================
+def current_cycle_id(now: datetime) -> str:
+    local = now.astimezone(TZ)
+    if local.time() < RESET_AT:
+        cycle_date = (local.date() - timedelta(days=1))
+    else:
+        cycle_date = local.date()
+    return cycle_date.isoformat()
 
-    # 2) PTB app bouwen
-    app = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .read_timeout(READ_TIMEOUT)
-        .write_timeout(WRITE_TIMEOUT)
-        .connect_timeout(CONNECT_TIMEOUT)
-        .build()
+# ================== DB ==================
+async def db_init():
+    global DB_POOL
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL ontbreekt. Zet DATABASE_URL in je BOT service variables.")
+
+    DB_POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+
+    async with DB_POOL.acquire() as conn:
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS joined_names (
+            name TEXT PRIMARY KEY,
+            first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """)
+
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS used_names (
+            cycle_id DATE NOT NULL,
+            name TEXT NOT NULL,
+            PRIMARY KEY (cycle_id, name)
+        );
+        """)
+
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS bot_verify_messages (
+            message_id BIGINT PRIMARY KEY,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """)
+
+        await conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_bot_verify_messages_created_at
+        ON bot_verify_messages(created_at);
+        """)
+
+    logging.info("DB initialized ok")
+
+async def db_close():
+    global DB_POOL
+    if DB_POOL is not None:
+        await DB_POOL.close()
+        DB_POOL = None
+        logging.info("DB pool closed")
+
+async def db_load_joined_names_into_memory():
+    global JOINED_NAMES
+    async with DB_POOL.acquire() as conn:
+        rows = await conn.fetch("SELECT name FROM joined_names ORDER BY first_seen ASC;")
+    JOINED_NAMES = [r["name"] for r in rows]
+    logging.info("Loaded %d joined names from DB", len(JOINED_NAMES))
+
+async def db_remember_joined_name(name: str):
+    name = (name or "").strip()
+    if not name:
+        return
+
+    for attempt in range(3):
+        try:
+            async with DB_POOL.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO joined_names(name) VALUES($1) ON CONFLICT (name) DO NOTHING;",
+                    name
+                )
+            break
+        except Exception:
+            logging.exception("DB remember name failed attempt=%s", attempt + 1)
+            await asyncio.sleep(1 + attempt)
+
+    if name not in JOINED_NAMES:
+        JOINED_NAMES.append(name)
+
+async def db_is_used(name: str) -> bool:
+    cid = current_cycle_id(datetime.now(TZ))
+    async with DB_POOL.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT 1 FROM used_names WHERE cycle_id = $1::date AND name = $2 LIMIT 1;",
+            cid, name
+        )
+    return row is not None
+
+async def db_mark_used(name: str):
+    cid = current_cycle_id(datetime.now(TZ))
+    for attempt in range(3):
+        try:
+            async with DB_POOL.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO used_names(cycle_id, name) VALUES($1::date, $2) ON CONFLICT DO NOTHING;",
+                    cid, name
+                )
+            return
+        except Exception:
+            logging.exception("DB mark used failed attempt=%s", attempt + 1)
+            await asyncio.sleep(1 + attempt)
+
+async def db_track_bot_verify_message_id(message_id: int):
+    global BOT_MSG_PRUNE_COUNTER
+
+    for attempt in range(3):
+        try:
+            async with DB_POOL.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO bot_verify_messages(message_id) VALUES($1) ON CONFLICT DO NOTHING;",
+                    int(message_id)
+                )
+
+                BOT_MSG_PRUNE_COUNTER += 1
+                if BOT_MSG_PRUNE_COUNTER % BOT_MSG_PRUNE_EVERY != 0:
+                    return
+
+                # retention
+                await conn.execute(
+                    f"DELETE FROM bot_verify_messages "
+                    f"WHERE created_at < NOW() - INTERVAL '{BOT_MSG_RETENTION_DAYS} days';"
+                )
+
+                # cap rows
+                await conn.execute(
+                    """
+                    DELETE FROM bot_verify_messages
+                    WHERE message_id IN (
+                        SELECT message_id
+                        FROM bot_verify_messages
+                        ORDER BY created_at DESC
+                        OFFSET $1
+                    );
+                    """,
+                    BOT_MSG_MAX_ROWS
+                )
+            return
+        except Exception:
+            logging.exception("DB track bot message failed attempt=%s", attempt + 1)
+            await asyncio.sleep(1 + attempt)
+
+# ================== TELEGRAM SEND (MAX RETRIES + CIRCUIT BREAKER) ==================
+async def safe_send(coro_factory, what: str, max_retries: int = 5):
+    """
+    - Max retries + exponential backoff
+    - Circuit breaker: als Telegram onbereikbaar lijkt, pauzeer 5 min.
+    """
+    global TELEGRAM_PAUSE_UNTIL
+
+    now = _time.time()
+    if now < TELEGRAM_PAUSE_UNTIL:
+        wait = int(TELEGRAM_PAUSE_UNTIL - now)
+        logging.warning("%s skipped, Telegram paused for %ss", what, wait)
+        return None
+
+    failures = 0
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            return await coro_factory()
+        except RetryAfter as e:
+            sleep_s = e.retry_after + 1
+            logging.warning("%s rate limited. Sleep %ss (attempt %s/%s)", what, sleep_s, attempt, max_retries)
+            await asyncio.sleep(sleep_s)
+        except (TimedOut, NetworkError) as e:
+            failures += 1
+            backoff = min(30, 2 ** attempt)  # 2,4,8,16,30
+            logging.warning(
+                "%s transient network error: %s. backoff %ss (attempt %s/%s)",
+                what, e, backoff, attempt, max_retries
+            )
+            await asyncio.sleep(backoff)
+        except Forbidden as e:
+            logging.exception("%s forbidden (rights/bot kicked?): %s", what, e)
+            return None
+        except BadRequest as e:
+            logging.exception("%s bad request: %s", what, e)
+            return None
+        except Exception as e:
+            logging.exception("%s unexpected error: %s", what, e)
+            await asyncio.sleep(2)
+
+    # circuit breaker
+    if failures >= 3:
+        TELEGRAM_PAUSE_UNTIL = _time.time() + 300  # 5 min
+        logging.error("Telegram lijkt onbereikbaar. Pauzeer sends voor 5 minuten.")
+
+    logging.error("%s failed after %s retries - skipping", what, max_retries)
+    return None
+
+async def delete_later(bot, chat_id, message_id, delay_seconds: int):
+    await asyncio.sleep(delay_seconds)
+    await safe_send(lambda: bot.delete_message(chat_id=chat_id, message_id=message_id), "delete_message")
+
+async def send_text(bot, chat_id, thread_id, text):
+    if thread_id is None:
+        return await safe_send(lambda: bot.send_message(chat_id=chat_id, text=text), "send_message(main)")
+
+    msg = await safe_send(
+        lambda: bot.send_message(chat_id=chat_id, message_thread_id=thread_id, text=text),
+        f"send_message(thread={thread_id})"
     )
 
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("ping", ping_cmd))
-    app.add_handler(CommandHandler("used", used_cmd))
+    if msg and thread_id == VERIFY_THREAD_ID:
+        await db_track_bot_verify_message_id(msg.message_id)
 
-    # 3) Background task bij startup
-    async def post_init(a: Application) -> None:
-        if ENABLE_VERIFY:
-            a.create_task(verify_random_joiner_loop(a))
+    return msg
 
-    app.post_init = post_init
+async def send_photo(bot, chat_id, thread_id, photo_path, caption, reply_markup):
+    with open(photo_path, "rb") as photo:
+        if thread_id is None:
+            msg = await safe_send(
+                lambda: bot.send_photo(
+                    chat_id=chat_id,
+                    photo=photo,
+                    caption=caption,
+                    reply_markup=reply_markup,
+                    has_spoiler=True
+                ),
+                "send_photo(main)"
+            )
+        else:
+            msg = await safe_send(
+                lambda: bot.send_photo(
+                    chat_id=chat_id,
+                    message_thread_id=thread_id,
+                    photo=photo,
+                    caption=caption,
+                    reply_markup=reply_markup,
+                    has_spoiler=True
+                ),
+                f"send_photo(thread={thread_id})"
+            )
 
-    # 4) run_polling is SYNC (laat PTB de eventloop beheren)
-    try:
-        app.run_polling(
-            poll_interval=POLL_INTERVAL,
-            drop_pending_updates=DROP_PENDING_UPDATES,
-            allowed_updates=Update.ALL_TYPES,
+    if msg and thread_id == VERIFY_THREAD_ID:
+        await db_track_bot_verify_message_id(msg.message_id)
+
+    return msg
+
+# ================== LOOPS ==================
+async def reset_loop():
+    while True:
+        now = datetime.now(TZ)
+        target = datetime.combine(now.date(), RESET_AT, tzinfo=TZ)
+        if now >= target:
+            target = target + timedelta(days=1)
+
+        await asyncio.sleep(max(1, int((target - now).total_seconds())))
+        logging.info("Cycle boundary reached at 05:00")
+
+async def cleanup_verify_topic_loop(app: Application):
+    while True:
+        now = datetime.now(TZ)
+        target = datetime.combine(now.date(), RESET_AT, tzinfo=TZ)
+        if now >= target:
+            target = target + timedelta(days=1)
+
+        await asyncio.sleep(max(1, int((target - now).total_seconds())))
+
+        async with DB_POOL.acquire() as conn:
+            rows = await conn.fetch("SELECT message_id FROM bot_verify_messages;")
+
+        ids = [int(r["message_id"]) for r in rows]
+        kept = []
+
+        for mid in ids:
+            ok = await safe_send(
+                lambda: app.bot.delete_message(chat_id=CHAT_ID, message_id=mid),
+                "cleanup_delete_message"
+            )
+            if ok is None:
+                kept.append(mid)
+
+        async with DB_POOL.acquire() as conn:
+            await conn.execute("TRUNCATE TABLE bot_verify_messages;")
+            if kept:
+                await conn.executemany(
+                    "INSERT INTO bot_verify_messages(message_id) VALUES($1) ON CONFLICT DO NOTHING;",
+                    [(m,) for m in kept]
+                )
+
+        logging.info("Cleanup verify-topic bot messages at 05:00 done. kept=%d", len(kept))
+
+async def daily_post_loop(app: Application):
+    last_msg_id = None
+
+    while True:
+        msg = await send_photo(
+            app.bot, CHAT_ID, DAILY_THREAD_ID,
+            PHOTO_PATH, WELCOME_TEXT, build_keyboard()
         )
-    finally:
-        # net shutdown (db)
-        asyncio.run(st.close())
 
+        if last_msg_id:
+            safe_create_task(delete_later(app.bot, CHAT_ID, last_msg_id, DELETE_DAILY_SECONDS), "delete_old_daily")
+
+        if msg:
+            last_msg_id = msg.message_id
+            await safe_send(lambda: app.bot.pin_chat_message(chat_id=CHAT_ID, message_id=msg.message_id), "pin_chat_message")
+
+        await asyncio.sleep(DAILY_SECONDS)
+
+async def verify_random_joiner_loop(app: Application):
+    while True:
+        if JOINED_NAMES:
+            name = random.choice([n for n in JOINED_NAMES if n])
+            if name and (not await db_is_used(name)):
+                await send_text(app.bot, CHAT_ID, VERIFY_THREAD_ID, unlocked_text(name))
+                await db_mark_used(name)
+
+        await asyncio.sleep(VERIFY_SECONDS)
+
+# ================== ALIAS GENERATOR ==================
+NL_CITY_CODES = ["010","020","030","040","050","070","073","076","079","071","072","074","075","078"]
+SEPARATORS = ["_", ".", "-"]
+PREFIXES = ["x", "mr", "its", "real", "official", "the", "iam", "nl", "dm", "vip", "urban", "city", "only"]
+EMOJIS = ["🔥", "💎", "👻", "⚡", "🚀", "✅"]
+
+def _name_fragments_from_joined():
+    frags = []
+    for n in JOINED_NAMES:
+        n = (n or "").strip().lower()
+        n = "".join(ch for ch in n if ch.isalpha())
+        if len(n) >= 4:
+            for _ in range(2):
+                start = random.randint(0, max(0, len(n) - 3))
+                frag_len = random.randint(2, 4)
+                frag = n[start:start+frag_len]
+                if frag and frag not in frags:
+                    frags.append(frag)
+    return frags
+
+def random_alias_from_joined():
+    frags = _name_fragments_from_joined()
+    if not frags:
+        frags = ["nova", "sky", "dex", "luna", "vex", "rio", "mira", "zen"]
+
+    code = random.choice(NL_CITY_CODES)
+    sep = random.choice(SEPARATORS)
+    prefix = random.choice(PREFIXES)
+    frag1 = random.choice(frags)
+    frag2 = random.choice(frags)
+    while frag2 == frag1:
+        frag2 = random.choice(frags)
+
+    digits = "".join(random.choices(string.digits, k=random.randint(2, 4)))
+
+    style = random.choice([
+        "prefix_frag_digits",
+        "frag_code_digits",
+        "frag_frag_digits",
+        "prefix_frag_code",
+        "prefix_frag_sep_frag_digits",
+        "frag_digits_emoji",
+    ])
+
+    if style == "prefix_frag_digits":
+        base = f"{prefix}{sep}{frag1}{digits}"
+    elif style == "frag_code_digits":
+        base = f"{frag1}{sep}{code}{sep}{digits}"
+    elif style == "frag_frag_digits":
+        base = f"{frag1}{sep}{frag2}{digits}"
+    elif style == "prefix_frag_code":
+        base = f"{prefix}{sep}{frag1}{sep}{code}"
+    elif style == "frag_digits_emoji":
+        base = f"{frag1}{digits}{random.choice(EMOJIS)}"
+    else:
+        base = f"{prefix}{sep}{frag1}{sep}{frag2}{sep}{digits}"
+
+    base = base.strip()
+    if not base or base.isdigit():
+        base = f"user{sep}{digits}"
+    return base
+
+async def activity_loop(app: Application):
+    while True:
+        alias = random_alias_from_joined()
+        text = f"{alias} Successfully unlocked the group✅"
+
+        msg = await send_text(app.bot, CHAT_ID, VERIFY_THREAD_ID, text)
+
+        if msg:
+            safe_create_task(delete_later(app.bot, CHAT_ID, msg.message_id, DELETE_LEAVE_SECONDS), "delete_activity_msg")
+
+        await asyncio.sleep(ACTIVITY_SECONDS)
+
+# ================== HANDLERS ==================
+async def on_open_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer(
+        "Can’t acces the group, because unfortunately you haven’t shared the group 3 times yet.",
+        show_alert=True
+    )
+
+async def announce_join_after_delay(context: ContextTypes.DEFAULT_TYPE, name: str):
+    await asyncio.sleep(JOIN_DELAY_SECONDS)
+    name = (name or "").strip()
+    if not name:
+        return
+
+    if await db_is_used(name):
+        return
+
+    await send_text(context.bot, CHAT_ID, VERIFY_THREAD_ID, unlocked_text(name))
+    await db_mark_used(name)
+
+async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.new_chat_members:
+        return
+    if not update.effective_chat or update.effective_chat.id != CHAT_ID:
+        return
+
+    for member in update.message.new_chat_members:
+        name = (member.full_name or "").strip()
+        if name:
+            await db_remember_joined_name(name)
+            safe_create_task(announce_join_after_delay(context, name), f"announce_join_after_delay({name})")
+
+# ================== INIT ==================
+async def post_init(app: Application):
+    me = await app.bot.get_me()
+    logging.info("Bot started: @%s", me.username)
+
+    await db_init()
+    await db_load_joined_names_into_memory()
+
+    # Startup test
+    ok = await safe_send(lambda: app.bot.send_message(chat_id=CHAT_ID, text="✅ bot gestart (startup test)"), "startup_test")
+    if ok is None:
+        logging.error("Startup test failed - check CHAT_ID, bot rights, Telegram connectivity from Railway.")
+
+    safe_create_task(reset_loop(), "reset_loop")
+
+    if ENABLE_CLEANUP:
+        safe_create_task(cleanup_verify_topic_loop(app), "cleanup_verify_topic_loop")
+    else:
+        logging.info("ENABLE_CLEANUP=0 -> cleanup disabled")
+
+    if ENABLE_DAILY:
+        safe_create_task(daily_post_loop(app), "daily_post_loop")
+    else:
+        logging.info("ENABLE_DAILY=0 -> daily disabled")
+
+    if ENABLE_VERIFY:
+        safe_create_task(verify_random_joiner_loop(app), "verify_random_joiner_loop")
+    else:
+        logging.info("ENABLE_VERIFY=0 -> verify disabled")
+
+    if ENABLE_ACTIVITY:
+        safe_create_task(activity_loop(app), "activity_loop")
+    else:
+        logging.info("ENABLE_ACTIVITY=0 -> activity disabled")
+
+# ================== ASYNC RUN (OPLOSSING 1) ==================
+async def run_bot(app: Application):
+    stop_event = asyncio.Event()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except NotImplementedError:
+            signal.signal(sig, lambda *_: stop_event.set())
+
+    await app.initialize()
+    await app.start()
+
+    await app.updater.start_polling(
+        poll_interval=POLL_INTERVAL,
+        drop_pending_updates=DROP_PENDING_UPDATES,
+        allowed_updates=Update.ALL_TYPES,
+    )
+
+    logging.info("Polling gestart (poll_interval=%s, drop_pending_updates=%s)", POLL_INTERVAL, DROP_PENDING_UPDATES)
+
+    await stop_event.wait()
+    logging.info("Stop signaal ontvangen -> shutdown...")
+
+    await app.updater.stop()
+    await app.stop()
+    await app.shutdown()
+
+async def cancel_background_tasks():
+    for t in BACKGROUND_TASKS:
+        if not t.done():
+            t.cancel()
+    if BACKGROUND_TASKS:
+        await asyncio.gather(*BACKGROUND_TASKS, return_exceptions=True)
+
+async def main():
+    if not TOKEN:
+        raise RuntimeError("BOT_TOKEN ontbreekt. Zet BOT_TOKEN in je BOT service variables.")
+
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
+
+    app.add_handler(CallbackQueryHandler(on_open_group, pattern="^open_group$"))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
+
+    try:
+        await run_bot(app)
+    finally:
+        await cancel_background_tasks()
+        try:
+            await db_close()
+        except Exception:
+            logging.exception("DB close failed")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
