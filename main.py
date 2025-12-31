@@ -17,7 +17,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from telegram.error import RetryAfter, TimedOut, NetworkError, Forbidden, BadRequest, Conflict
+from telegram.error import RetryAfter, TimedOut, NetworkError, Forbidden, BadRequest
 
 logging.basicConfig(level=logging.INFO)
 
@@ -34,7 +34,7 @@ CHAT_ID = -1003328329377
 DAILY_THREAD_ID = None
 VERIFY_THREAD_ID = 4
 
-PHOTO_PATH = "banner.jpg"
+PHOTO_PATH = "image (6).png"
 
 # TEST intervals (seconds)
 DAILY_SECONDS = 17
@@ -52,22 +52,27 @@ BOT_MSG_PRUNE_EVERY = 200
 BOT_MSG_PRUNE_COUNTER = 0
 
 # ===== ENABLE FLAGS via Railway Variables =====
+# Zet in Railway -> Variables bij je BOT service:
+# ENABLE_DAILY=1 / 0
+# ENABLE_VERIFY=1 / 0
+# ENABLE_ACTIVITY=1 / 0
+# ENABLE_CLEANUP=1 / 0
 ENABLE_DAILY = os.getenv("ENABLE_DAILY", "1") == "1"
 ENABLE_VERIFY = os.getenv("ENABLE_VERIFY", "1") == "1"
-ENABLE_ACTIVITY = os.getenv("ENABLE_ACTIVITY", "1") == "1"
+ENABLE_ACTIVITY = os.getenv("ENABLE_ACTIVITY", "1") == "1"  # ✅ activity weer aan
 ENABLE_CLEANUP = os.getenv("ENABLE_CLEANUP", "1") == "1"
 
 # ===== Telegram circuit breaker =====
 TELEGRAM_PAUSE_UNTIL = 0.0  # epoch seconds
 
-# ===== SINGLE INSTANCE LOCK (Postgres advisory lock) =====
-# Kies een vaste integer. (Mag ook gebaseerd op CHAT_ID, maar fixed is prima.)
-PG_ADVISORY_LOCK_KEY = 88442211
+# ===== Single instance lock (Postgres advisory lock) =====
+# Zorgt dat er nooit 2 pollers tegelijk draaien (Railway/Restart/duplicaat)
+POLL_LOCK_KEY = 88442211  # mag elk int zijn, maar houd 'm constant
+POLLING_LOCK_ACQUIRED = False
 
 # ================== DB GLOBALS ==================
 DB_POOL: asyncpg.Pool | None = None
 JOINED_NAMES: list[str] = []
-LOCK_ACQUIRED = False
 
 # ================== CONTENT ==================
 WELCOME_TEXT = (
@@ -106,23 +111,30 @@ def safe_create_task(coro, name: str):
     return task
 
 # ================== CYCLE HELPERS ==================
-def current_cycle_id(now: datetime) -> date:
-    """
-    Return een python date (NIET string), zodat asyncpg happy is met DATE.
-    Cycle boundary = 05:00 Amsterdam.
-    """
+def current_cycle_date(now: datetime) -> date:
+    """Return a real python date (NOT string) to match Postgres DATE type."""
     local = now.astimezone(TZ)
     if local.time() < RESET_AT:
-        return (local.date() - timedelta(days=1))
+        return local.date() - timedelta(days=1)
     return local.date()
 
 # ================== DB ==================
 async def db_init():
-    global DB_POOL
+    global DB_POOL, POLLING_LOCK_ACQUIRED
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL ontbreekt. Zet DATABASE_URL in je BOT service variables.")
 
     DB_POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+
+    # ===== Acquire advisory lock to ensure single polling instance =====
+    async with DB_POOL.acquire() as conn:
+        got = await conn.fetchval("SELECT pg_try_advisory_lock($1);", POLL_LOCK_KEY)
+        if not got:
+            POLLING_LOCK_ACQUIRED = False
+            logging.error("❌ Another instance is already running (polling lock not acquired). Exiting.")
+            raise SystemExit(1)
+        POLLING_LOCK_ACQUIRED = True
+        logging.info("✅ Acquired single-instance polling lock (%s)", POLL_LOCK_KEY)
 
     async with DB_POOL.acquire() as conn:
         await conn.execute("""
@@ -154,47 +166,36 @@ async def db_init():
 
     logging.info("DB initialized ok")
 
-async def db_acquire_single_instance_lock():
-    """
-    Voorkomt dat Railway (rolling deploy / restart) 2 instances tegelijk poll-en.
-    Als lock niet lukt -> exit container (zodat maar 1 instance overblijft).
-    """
-    global LOCK_ACQUIRED
-    if DB_POOL is None:
-        raise RuntimeError("DB_POOL is None in db_acquire_single_instance_lock()")
+async def db_release_lock_and_close():
+    """Best effort: release advisory lock + close pool."""
+    global DB_POOL, POLLING_LOCK_ACQUIRED
+    if not DB_POOL:
+        return
 
-    async with DB_POOL.acquire() as conn:
-        got = await conn.fetchval("SELECT pg_try_advisory_lock($1);", PG_ADVISORY_LOCK_KEY)
+    try:
+        async with DB_POOL.acquire() as conn:
+            if POLLING_LOCK_ACQUIRED:
+                await conn.execute("SELECT pg_advisory_unlock($1);", POLL_LOCK_KEY)
+                logging.info("🔓 Released polling lock (%s)", POLL_LOCK_KEY)
+                POLLING_LOCK_ACQUIRED = False
+    except Exception:
+        logging.exception("Failed to release polling lock (ignored)")
 
-    if not got:
-        logging.error(
-            "❌ Another instance holds the polling lock (pg_try_advisory_lock=%s). "
-            "Stopping THIS instance to avoid 409 Conflict.",
-            PG_ADVISORY_LOCK_KEY
-        )
-        # Hard stop: laat Railway deze container killen
-        raise SystemExit(0)
-
-    LOCK_ACQUIRED = True
-    logging.info("✅ Acquired single-instance polling lock (%s)", PG_ADVISORY_LOCK_KEY)
+    try:
+        await DB_POOL.close()
+    except Exception:
+        logging.exception("Failed to close DB pool (ignored)")
 
 async def db_load_joined_names_into_memory():
     global JOINED_NAMES
-    if DB_POOL is None:
-        raise RuntimeError("DB_POOL is None in db_load_joined_names_into_memory()")
-
     async with DB_POOL.acquire() as conn:
         rows = await conn.fetch("SELECT name FROM joined_names ORDER BY first_seen ASC;")
     JOINED_NAMES = [r["name"] for r in rows]
     logging.info("Loaded %d joined names from DB", len(JOINED_NAMES))
 
 async def db_remember_joined_name(name: str):
-    global JOINED_NAMES
     name = (name or "").strip()
     if not name:
-        return
-    if DB_POOL is None:
-        logging.warning("DB_POOL not ready yet; skip remember name")
         return
 
     for attempt in range(3):
@@ -213,27 +214,21 @@ async def db_remember_joined_name(name: str):
         JOINED_NAMES.append(name)
 
 async def db_is_used(name: str) -> bool:
-    if DB_POOL is None:
-        return False
-
-    cid = current_cycle_id(datetime.now(TZ))  # python date
+    cid = current_cycle_date(datetime.now(TZ))  # ✅ date object
     async with DB_POOL.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT 1 FROM used_names WHERE cycle_id = $1 AND name = $2 LIMIT 1;",
+            "SELECT 1 FROM used_names WHERE cycle_id = $1::date AND name = $2 LIMIT 1;",
             cid, name
         )
     return row is not None
 
 async def db_mark_used(name: str):
-    if DB_POOL is None:
-        return
-
-    cid = current_cycle_id(datetime.now(TZ))  # python date
+    cid = current_cycle_date(datetime.now(TZ))  # ✅ date object
     for attempt in range(3):
         try:
             async with DB_POOL.acquire() as conn:
                 await conn.execute(
-                    "INSERT INTO used_names(cycle_id, name) VALUES($1, $2) ON CONFLICT DO NOTHING;",
+                    "INSERT INTO used_names(cycle_id, name) VALUES($1::date, $2) ON CONFLICT DO NOTHING;",
                     cid, name
                 )
             return
@@ -243,8 +238,6 @@ async def db_mark_used(name: str):
 
 async def db_track_bot_verify_message_id(message_id: int):
     global BOT_MSG_PRUNE_COUNTER
-    if DB_POOL is None:
-        return
 
     for attempt in range(3):
         try:
@@ -258,11 +251,13 @@ async def db_track_bot_verify_message_id(message_id: int):
                 if BOT_MSG_PRUNE_COUNTER % BOT_MSG_PRUNE_EVERY != 0:
                     return
 
+                # retention
                 await conn.execute(
                     f"DELETE FROM bot_verify_messages "
                     f"WHERE created_at < NOW() - INTERVAL '{BOT_MSG_RETENTION_DAYS} days';"
                 )
 
+                # cap rows
                 await conn.execute(
                     """
                     DELETE FROM bot_verify_messages
@@ -282,6 +277,10 @@ async def db_track_bot_verify_message_id(message_id: int):
 
 # ================== TELEGRAM SEND (MAX RETRIES + CIRCUIT BREAKER) ==================
 async def safe_send(coro_factory, what: str, max_retries: int = 5):
+    """
+    - Max retries + exponential backoff
+    - Circuit breaker: als Telegram onbereikbaar lijkt, pauzeer 5 min.
+    """
     global TELEGRAM_PAUSE_UNTIL
 
     now = _time.time()
@@ -314,6 +313,7 @@ async def safe_send(coro_factory, what: str, max_retries: int = 5):
             logging.exception("%s unexpected error: %s", what, e)
             await asyncio.sleep(2)
 
+    # circuit breaker
     if failures >= 3:
         TELEGRAM_PAUSE_UNTIL = _time.time() + 300  # 5 min
         logging.error("Telegram lijkt onbereikbaar. Pauzeer sends voor 5 minuten.")
@@ -390,9 +390,6 @@ async def cleanup_verify_topic_loop(app: Application):
 
         await asyncio.sleep(max(1, int((target - now).total_seconds())))
 
-        if DB_POOL is None:
-            continue
-
         async with DB_POOL.acquire() as conn:
             rows = await conn.fetch("SELECT message_id FROM bot_verify_messages;")
 
@@ -438,6 +435,7 @@ async def daily_post_loop(app: Application):
 async def verify_random_joiner_loop(app: Application):
     while True:
         if JOINED_NAMES:
+            # pak een echte naam die we al kennen
             name = random.choice([n for n in JOINED_NAMES if n])
             if name and (not await db_is_used(name)):
                 await send_text(app.bot, CHAT_ID, VERIFY_THREAD_ID, unlocked_text(name))
@@ -508,6 +506,7 @@ def random_alias_from_joined():
     return base
 
 async def activity_loop(app: Application):
+    # ✅ activity aan: blijft fake aliases posten
     while True:
         alias = random_alias_from_joined()
         text = f"{alias} Successfully unlocked the group✅"
@@ -550,23 +549,15 @@ async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await db_remember_joined_name(name)
             safe_create_task(announce_join_after_delay(context, name), f"announce_join_after_delay({name})")
 
-# ================== ERROR HANDLER ==================
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    err = context.error
-    if isinstance(err, Conflict):
-        logging.error("409 Conflict: er draait (heel kort) een andere polling instance. Advisory lock voorkomt dit.")
-        return
-    logging.exception("Unhandled error", exc_info=err)
-
 # ================== INIT ==================
 async def post_init(app: Application):
     me = await app.bot.get_me()
     logging.info("Bot started: @%s", me.username)
 
     await db_init()
-    await db_acquire_single_instance_lock()
     await db_load_joined_names_into_memory()
 
+    # Startup test
     ok = await safe_send(lambda: app.bot.send_message(chat_id=CHAT_ID, text="✅ bot gestart (startup test)"), "startup_test")
     if ok is None:
         logging.error("Startup test failed - check CHAT_ID, bot rights, Telegram connectivity from Railway.")
@@ -593,15 +584,31 @@ async def post_init(app: Application):
     else:
         logging.info("ENABLE_ACTIVITY=0 -> activity disabled")
 
+async def post_shutdown(app: Application):
+    await db_release_lock_and_close()
+
 def main():
-    app = Application.builder().token(TOKEN).post_init(post_init).build()
+    if not TOKEN:
+        raise RuntimeError("BOT_TOKEN ontbreekt.")
+
+    # Builder timeouts (extra; naast safe_send retries)
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .connect_timeout(10)
+        .read_timeout(20)
+        .write_timeout(20)
+        .pool_timeout(20)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
 
     app.add_handler(CallbackQueryHandler(on_open_group, pattern="^open_group$"))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
-    app.add_error_handler(on_error)
 
-    # drop_pending_updates True voorkomt oude backlog; poll_interval mag je houden
-    app.run_polling(drop_pending_updates=True)
+    # drop_pending_updates True voorkomt oude backlog spam bij restart
+    app.run_polling(drop_pending_updates=True, poll_interval=1.0)
 
 if __name__ == "__main__":
     main()
