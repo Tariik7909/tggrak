@@ -35,7 +35,7 @@ DAILY_THREAD_ID = None
 VERIFY_THREAD_ID = 4
 
 # Allow override via env:
-PHOTO_PATH = os.getenv("PHOTO_PATH", "banner.jpg")
+PHOTO_PATH = os.getenv("PHOTO_PATH", "image (6).png")
 
 # TEST intervals (seconds)
 DAILY_SECONDS = int(os.getenv("DAILY_SECONDS", "17"))
