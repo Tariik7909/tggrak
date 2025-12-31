@@ -34,7 +34,7 @@ CHAT_ID = -1003328329377
 DAILY_THREAD_ID = None
 VERIFY_THREAD_ID = 4
 
-PHOTO_PATH = "banner.jpg"
+PHOTO_PATH = "image (6).png"
 
 # TEST intervals (seconds)
 DAILY_SECONDS = 17
