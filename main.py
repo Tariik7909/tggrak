@@ -6,6 +6,7 @@ import string
 import time as _time
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
+from io import BytesIO
 
 import asyncpg
 
@@ -17,7 +18,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from telegram.error import RetryAfter, TimedOut, NetworkError, Forbidden, BadRequest, Conflict
+from telegram.error import RetryAfter, TimedOut, NetworkError, Forbidden, BadRequest
 
 logging.basicConfig(level=logging.INFO)
 
@@ -34,22 +35,22 @@ CHAT_ID = -1003328329377
 DAILY_THREAD_ID = None
 VERIFY_THREAD_ID = 4
 
-# Allow override via env:
-PHOTO_PATH = os.getenv("PHOTO_PATH", "image (6).png")
+# ✅ JOUW FOTO NAAM
+PHOTO_PATH = "image (6).png"
 
 # TEST intervals (seconds)
-DAILY_SECONDS = int(os.getenv("DAILY_SECONDS", "17"))
-VERIFY_SECONDS = int(os.getenv("VERIFY_SECONDS", "15"))
-JOIN_DELAY_SECONDS = int(os.getenv("JOIN_DELAY_SECONDS", str(5 * 60)))
-ACTIVITY_SECONDS = int(os.getenv("ACTIVITY_SECONDS", "15"))
+DAILY_SECONDS = 17
+VERIFY_SECONDS = 15
+JOIN_DELAY_SECONDS = 5 * 60
+ACTIVITY_SECONDS = 15
 
-DELETE_DAILY_SECONDS = int(os.getenv("DELETE_DAILY_SECONDS", "34"))
-DELETE_LEAVE_SECONDS = int(os.getenv("DELETE_LEAVE_SECONDS", str(10000 * 6000)))
+DELETE_DAILY_SECONDS = 34
+DELETE_LEAVE_SECONDS = 10000 * 6000
 
 # ===== OPTIE B: prune verify-message logging =====
-BOT_MSG_RETENTION_DAYS = int(os.getenv("BOT_MSG_RETENTION_DAYS", "2"))
-BOT_MSG_MAX_ROWS = int(os.getenv("BOT_MSG_MAX_ROWS", "20000"))
-BOT_MSG_PRUNE_EVERY = int(os.getenv("BOT_MSG_PRUNE_EVERY", "200"))
+BOT_MSG_RETENTION_DAYS = 2
+BOT_MSG_MAX_ROWS = 20000
+BOT_MSG_PRUNE_EVERY = 200
 BOT_MSG_PRUNE_COUNTER = 0
 
 # ===== ENABLE FLAGS via Railway Variables =====
@@ -63,11 +64,6 @@ TELEGRAM_PAUSE_UNTIL = 0.0  # epoch seconds
 
 # ================== DB GLOBALS ==================
 DB_POOL: asyncpg.Pool | None = None
-
-# Keep one connection open for advisory lock ownership
-LOCK_CONN: asyncpg.Connection | None = None
-LOCK_KEY = 88442211  # any int32/int64 is fine, keep stable
-
 JOINED_NAMES: list[str] = []
 
 # ================== CONTENT ==================
@@ -93,41 +89,27 @@ def build_keyboard():
 def unlocked_text(name: str) -> str:
     return f"{name} Successfully unlocked the group✅"
 
-# ================== SAFETY: TASK CRASH LOGGING + TRACKING ==================
-BACKGROUND_TASKS: set[asyncio.Task] = set()
-STOP_EVENT = asyncio.Event()
-
+# ================== SAFETY: TASK CRASH LOGGING ==================
 def safe_create_task(coro, name: str):
-    task = asyncio.create_task(coro, name=name)
+    task = asyncio.create_task(coro)
 
     def _done(t: asyncio.Task):
-        BACKGROUND_TASKS.discard(t)
         try:
             t.result()
-        except asyncio.CancelledError:
-            return
         except Exception:
             logging.exception("Task crashed: %s", name)
 
-    BACKGROUND_TASKS.add(task)
     task.add_done_callback(_done)
     return task
 
-async def cancel_background_tasks():
-    # Cancel everything gracefully
-    if not BACKGROUND_TASKS:
-        return
-    for t in list(BACKGROUND_TASKS):
-        t.cancel()
-    await asyncio.gather(*list(BACKGROUND_TASKS), return_exceptions=True)
-    BACKGROUND_TASKS.clear()
-
 # ================== CYCLE HELPERS ==================
-def current_cycle_date(now: datetime) -> datetime.date:
+def current_cycle_id(now: datetime) -> str:
     local = now.astimezone(TZ)
     if local.time() < RESET_AT:
-        return (local.date() - timedelta(days=1))
-    return local.date()
+        cycle_date = (local.date() - timedelta(days=1))
+    else:
+        cycle_date = local.date()
+    return cycle_date.isoformat()
 
 # ================== DB ==================
 async def db_init():
@@ -167,12 +149,6 @@ async def db_init():
 
     logging.info("DB initialized ok")
 
-async def db_close():
-    global DB_POOL
-    if DB_POOL:
-        await DB_POOL.close()
-        DB_POOL = None
-
 async def db_load_joined_names_into_memory():
     global JOINED_NAMES
     async with DB_POOL.acquire() as conn:
@@ -201,7 +177,7 @@ async def db_remember_joined_name(name: str):
         JOINED_NAMES.append(name)
 
 async def db_is_used(name: str) -> bool:
-    cid = current_cycle_date(datetime.now(TZ))  # <-- date object (fix asyncpg str->date crash)
+    cid = current_cycle_id(datetime.now(TZ))
     async with DB_POOL.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT 1 FROM used_names WHERE cycle_id = $1::date AND name = $2 LIMIT 1;",
@@ -210,7 +186,7 @@ async def db_is_used(name: str) -> bool:
     return row is not None
 
 async def db_mark_used(name: str):
-    cid = current_cycle_date(datetime.now(TZ))  # <-- date object
+    cid = current_cycle_id(datetime.now(TZ))
     for attempt in range(3):
         try:
             async with DB_POOL.acquire() as conn:
@@ -262,50 +238,16 @@ async def db_track_bot_verify_message_id(message_id: int):
             logging.exception("DB track bot message failed attempt=%s", attempt + 1)
             await asyncio.sleep(1 + attempt)
 
-# ================== POSTGRES ADVISORY LOCK (single instance) ==================
-async def acquire_polling_lock():
-    """
-    Uses a dedicated connection so we can reliably release the lock later.
-    """
-    global LOCK_CONN
-    if not DB_POOL:
-        raise RuntimeError("DB_POOL not initialized")
-
-    LOCK_CONN = await DB_POOL.acquire()
-    ok = await LOCK_CONN.fetchval("SELECT pg_try_advisory_lock($1);", LOCK_KEY)
-    if not ok:
-        raise RuntimeError("Another bot instance is already running (polling lock not acquired).")
-    logging.info("✅ Acquired single-instance polling lock (%s)", LOCK_KEY)
-
-async def release_polling_lock():
-    global LOCK_CONN
-    if LOCK_CONN is None:
-        return
-    try:
-        # release lock on SAME connection
-        await LOCK_CONN.execute("SELECT pg_advisory_unlock($1);", LOCK_KEY)
-        logging.info("🔓 Released polling lock (%s)", LOCK_KEY)
-    except Exception:
-        logging.exception("Failed releasing polling lock")
-    finally:
-        # Return dedicated conn to pool
-        try:
-            await DB_POOL.release(LOCK_CONN)
-        except Exception:
-            pass
-        LOCK_CONN = None
-
 # ================== TELEGRAM SEND (MAX RETRIES + CIRCUIT BREAKER) ==================
-def _is_delete_not_found(err: Exception) -> bool:
-    if not isinstance(err, BadRequest):
-        return False
-    msg = str(err).lower()
-    return ("message to delete not found" in msg) or ("message_id_invalid" in msg)
+def _is_delete_not_found(e: BadRequest) -> bool:
+    msg = (str(e) or "").lower()
+    return "message to delete not found" in msg or "message can't be deleted" in msg
 
 async def safe_send(coro_factory, what: str, max_retries: int = 5):
     """
     - Max retries + exponential backoff
-    - Circuit breaker: alleen voor echte network/timeouts (niet voor BadRequest 400's)
+    - Circuit breaker: als Telegram onbereikbaar lijkt, pauzeer 5 min.
+    - Delete 'message not found' => gewoon skip (geen retries)
     """
     global TELEGRAM_PAUSE_UNTIL
 
@@ -332,28 +274,25 @@ async def safe_send(coro_factory, what: str, max_retries: int = 5):
             logging.warning("%s transient network error: %s. backoff %ss (attempt %s/%s)", what, e, backoff, attempt, max_retries)
             await asyncio.sleep(backoff)
 
-        except BadRequest as e:
-            # IMPORTANT: delete-not-found is normal -> do NOT treat as network error
-            if _is_delete_not_found(e):
-                logging.info("%s ignored (delete not found): %s", what, e)
-                return None
-            logging.exception("%s bad request: %s", what, e)
-            return None
-
         except Forbidden as e:
             logging.exception("%s forbidden (rights/bot kicked?): %s", what, e)
             return None
 
-        except Conflict as e:
-            # This is the classic "other getUpdates request" issue
-            logging.exception("%s conflict (another poller running?): %s", what, e)
+        except BadRequest as e:
+            # ✅ deleteMessage "not found" is normaal -> niet retryen
+            if "delete_message" in what and _is_delete_not_found(e):
+                logging.info("%s: delete skipped (not found/already deleted).", what)
+                return None
+
+            # Andere BadRequest is echte fout (geen retries)
+            logging.exception("%s bad request: %s", what, e)
             return None
 
         except Exception as e:
             logging.exception("%s unexpected error: %s", what, e)
             await asyncio.sleep(2)
 
-    # circuit breaker only if we had multiple network failures
+    # circuit breaker
     if failures >= 3:
         TELEGRAM_PAUSE_UNTIL = _time.time() + 300  # 5 min
         logging.error("Telegram lijkt onbereikbaar. Pauzeer sends voor 5 minuten.")
@@ -379,35 +318,40 @@ async def send_text(bot, chat_id, thread_id, text):
 
     return msg
 
+# ✅ FIX: send_photo retries sturen nooit een lege file meer
 async def send_photo(bot, chat_id, thread_id, photo_path, caption, reply_markup):
-    if not os.path.exists(photo_path):
-        logging.error("PHOTO_PATH not found: %s (zet bestand in repo of pas PHOTO_PATH env aan)", photo_path)
+    try:
+        with open(photo_path, "rb") as f:
+            data = f.read()
+    except FileNotFoundError:
+        logging.error("PHOTO_PATH not found: %s (staat hij echt in je repo root?)", photo_path)
         return None
 
-    with open(photo_path, "rb") as photo:
-        if thread_id is None:
-            msg = await safe_send(
-                lambda: bot.send_photo(
-                    chat_id=chat_id,
-                    photo=photo,
-                    caption=caption,
-                    reply_markup=reply_markup,
-                    has_spoiler=True
-                ),
-                "send_photo(main)"
-            )
-        else:
-            msg = await safe_send(
-                lambda: bot.send_photo(
-                    chat_id=chat_id,
-                    message_thread_id=thread_id,
-                    photo=photo,
-                    caption=caption,
-                    reply_markup=reply_markup,
-                    has_spoiler=True
-                ),
-                f"send_photo(thread={thread_id})"
-            )
+    if not data:
+        logging.error("PHOTO_PATH is empty (0 bytes): %s", photo_path)
+        return None
+
+    async def _do_send():
+        bio = BytesIO(data)
+        bio.name = os.path.basename(photo_path)
+        bio.seek(0)
+
+        kwargs = dict(
+            chat_id=chat_id,
+            photo=bio,
+            caption=caption,
+            reply_markup=reply_markup,
+            has_spoiler=True
+        )
+        if thread_id is not None:
+            kwargs["message_thread_id"] = thread_id
+
+        return await bot.send_photo(**kwargs)
+
+    msg = await safe_send(
+        _do_send,
+        f"send_photo(thread={thread_id})" if thread_id else "send_photo(main)"
+    )
 
     if msg and thread_id == VERIFY_THREAD_ID:
         await db_track_bot_verify_message_id(msg.message_id)
@@ -416,31 +360,23 @@ async def send_photo(bot, chat_id, thread_id, photo_path, caption, reply_markup)
 
 # ================== LOOPS ==================
 async def reset_loop():
-    while not STOP_EVENT.is_set():
+    while True:
         now = datetime.now(TZ)
         target = datetime.combine(now.date(), RESET_AT, tzinfo=TZ)
         if now >= target:
             target = target + timedelta(days=1)
 
-        sleep_s = max(1, int((target - now).total_seconds()))
-        try:
-            await asyncio.wait_for(STOP_EVENT.wait(), timeout=sleep_s)
-        except asyncio.TimeoutError:
-            logging.info("Cycle boundary reached at 05:00")
+        await asyncio.sleep(max(1, int((target - now).total_seconds())))
+        logging.info("Cycle boundary reached at 05:00")
 
 async def cleanup_verify_topic_loop(app: Application):
-    while not STOP_EVENT.is_set():
+    while True:
         now = datetime.now(TZ)
         target = datetime.combine(now.date(), RESET_AT, tzinfo=TZ)
         if now >= target:
             target = target + timedelta(days=1)
 
-        sleep_s = max(1, int((target - now).total_seconds()))
-        try:
-            await asyncio.wait_for(STOP_EVENT.wait(), timeout=sleep_s)
-            return
-        except asyncio.TimeoutError:
-            pass
+        await asyncio.sleep(max(1, int((target - now).total_seconds())))
 
         async with DB_POOL.acquire() as conn:
             rows = await conn.fetch("SELECT message_id FROM bot_verify_messages;")
@@ -469,7 +405,7 @@ async def cleanup_verify_topic_loop(app: Application):
 async def daily_post_loop(app: Application):
     last_msg_id = None
 
-    while not STOP_EVENT.is_set():
+    while True:
         msg = await send_photo(
             app.bot, CHAT_ID, DAILY_THREAD_ID,
             PHOTO_PATH, WELCOME_TEXT, build_keyboard()
@@ -482,23 +418,17 @@ async def daily_post_loop(app: Application):
             last_msg_id = msg.message_id
             await safe_send(lambda: app.bot.pin_chat_message(chat_id=CHAT_ID, message_id=msg.message_id), "pin_chat_message")
 
-        try:
-            await asyncio.wait_for(STOP_EVENT.wait(), timeout=DAILY_SECONDS)
-        except asyncio.TimeoutError:
-            pass
+        await asyncio.sleep(DAILY_SECONDS)
 
 async def verify_random_joiner_loop(app: Application):
-    while not STOP_EVENT.is_set():
+    while True:
         if JOINED_NAMES:
             name = random.choice([n for n in JOINED_NAMES if n])
             if name and (not await db_is_used(name)):
                 await send_text(app.bot, CHAT_ID, VERIFY_THREAD_ID, unlocked_text(name))
                 await db_mark_used(name)
 
-        try:
-            await asyncio.wait_for(STOP_EVENT.wait(), timeout=VERIFY_SECONDS)
-        except asyncio.TimeoutError:
-            pass
+        await asyncio.sleep(VERIFY_SECONDS)
 
 # ================== ALIAS GENERATOR ==================
 NL_CITY_CODES = ["010","020","030","040","050","070","073","076","079","071","072","074","075","078"]
@@ -563,7 +493,7 @@ def random_alias_from_joined():
     return base
 
 async def activity_loop(app: Application):
-    while not STOP_EVENT.is_set():
+    while True:
         alias = random_alias_from_joined()
         text = f"{alias} Successfully unlocked the group✅"
 
@@ -572,10 +502,7 @@ async def activity_loop(app: Application):
         if msg:
             safe_create_task(delete_later(app.bot, CHAT_ID, msg.message_id, DELETE_LEAVE_SECONDS), "delete_activity_msg")
 
-        try:
-            await asyncio.wait_for(STOP_EVENT.wait(), timeout=ACTIVITY_SECONDS)
-        except asyncio.TimeoutError:
-            pass
+        await asyncio.sleep(ACTIVITY_SECONDS)
 
 # ================== HANDLERS ==================
 async def on_open_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -585,12 +512,7 @@ async def on_open_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def announce_join_after_delay(context: ContextTypes.DEFAULT_TYPE, name: str):
-    try:
-        await asyncio.wait_for(STOP_EVENT.wait(), timeout=JOIN_DELAY_SECONDS)
-        return
-    except asyncio.TimeoutError:
-        pass
-
+    await asyncio.sleep(JOIN_DELAY_SECONDS)
     name = (name or "").strip()
     if not name:
         return
@@ -613,17 +535,12 @@ async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await db_remember_joined_name(name)
             safe_create_task(announce_join_after_delay(context, name), f"announce_join_after_delay({name})")
 
-# ================== INIT / SHUTDOWN ==================
+# ================== INIT ==================
 async def post_init(app: Application):
-    if not TOKEN:
-        raise RuntimeError("BOT_TOKEN ontbreekt. Zet BOT_TOKEN in Railway variables.")
-
     me = await app.bot.get_me()
     logging.info("Bot started: @%s", me.username)
 
     await db_init()
-    await acquire_polling_lock()
-
     await db_load_joined_names_into_memory()
 
     # Startup test
@@ -653,30 +570,14 @@ async def post_init(app: Application):
     else:
         logging.info("ENABLE_ACTIVITY=0 -> activity disabled")
 
-async def post_shutdown(app: Application):
-    # Stop loops
-    STOP_EVENT.set()
-
-    # Cancel background tasks
-    await cancel_background_tasks()
-
-    # Release lock + close DB
-    await release_polling_lock()
-    await db_close()
-
 def main():
-    app = (
-        Application.builder()
-        .token(TOKEN)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
-        .build()
-    )
+    if not TOKEN:
+        raise RuntimeError("BOT_TOKEN ontbreekt. Zet BOT_TOKEN in je Railway Variables.")
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
 
     app.add_handler(CallbackQueryHandler(on_open_group, pattern="^open_group$"))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
 
-    # drop_pending_updates=True helps avoid old join events flooding after restart
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
