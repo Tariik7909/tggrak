@@ -1,5 +1,3 @@
-
-Je zei:
 import os
 import asyncio
 import random
